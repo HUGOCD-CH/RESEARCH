@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Outlook Local Viewer</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <nav class="nav">
+    <a class="nav-brand" href="{{ url_for('index') }}">Outlook Viewer</a>
+    {% if user is defined and user %}
+      <span class="nav-user">{{ user.get('displayName') or user.get('mail') or user.get('userPrincipalName', '') }}</span>
+      <a class="nav-link" href="{{ url_for('inbox') }}">Inbox</a>
+      <a class="nav-link" href="{{ url_for('logout') }}">Sign out</a>
+    {% endif %}
+  </nav>
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

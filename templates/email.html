@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="email-header">
+  <a class="btn btn-sm back-link" href="{{ url_for('inbox') }}">&larr; Back to Inbox</a>
+
+  <h2 class="email-subject">{{ message.get('subject') or '(no subject)' }}</h2>
+
+  <dl class="email-meta">
+    {% set sender = message.get('from', {}).get('emailAddress', {}) %}
+    <dt>From</dt>
+    <dd>{{ sender.get('name', '') }}{% if sender.get('name') %} &lt;{{ sender.get('address', '') }}&gt;{% else %}{{ sender.get('address', '') }}{% endif %}</dd>
+
+    {% set recipients = message.get('toRecipients', []) %}
+    {% if recipients %}
+    <dt>To</dt>
+    <dd>
+      {% for r in recipients %}
+        {{ r.get('emailAddress', {}).get('name') or r.get('emailAddress', {}).get('address', '') }}{% if not loop.last %}, {% endif %}
+      {% endfor %}
+    </dd>
+    {% endif %}
+
+    {% set cc = message.get('ccRecipients', []) %}
+    {% if cc %}
+    <dt>Cc</dt>
+    <dd>
+      {% for r in cc %}
+        {{ r.get('emailAddress', {}).get('name') or r.get('emailAddress', {}).get('address', '') }}{% if not loop.last %}, {% endif %}
+      {% endfor %}
+    </dd>
+    {% endif %}
+
+    <dt>Date</dt>
+    <dd>{{ message.get('receivedDateTime', '')[:19].replace('T', ' ') }} UTC</dd>
+  </dl>
+</div>
+
+<div class="email-body">
+  {% if body_type == 'html' %}
+  <iframe
+    srcdoc="{{ body_content | e }}"
+    sandbox="allow-same-origin"
+    referrerpolicy="no-referrer"
+    title="Email body"
+    onload="this.style.height=(this.contentDocument.documentElement.scrollHeight+20)+'px'">
+  </iframe>
+  {% else %}
+  <pre class="email-text">{{ body_content }}</pre>
+  {% endif %}
+</div>
+{% endblock %}

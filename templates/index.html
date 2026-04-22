@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="landing">
+  <h1>Outlook Local Viewer</h1>
+  <p>Read your Outlook or Microsoft 365 emails locally, right in your browser.</p>
+  <p>Your credentials never leave your machine — authentication happens directly between your computer and Microsoft.</p>
+  <a class="btn" href="{{ url_for('login') }}">Sign in with Microsoft</a>
+</div>
+{% endblock %}
