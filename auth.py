@@ -10,6 +10,7 @@ Key design choices:
 """
 import os
 import queue
+import re
 import threading
 import time
 import config
@@ -146,18 +147,27 @@ def _worker(q: queue.Queue):
             except Exception:
                 pass  # redirect chain may exceed domcontentloaded; keep going
 
-            # Poll until OWA inbox is fully rendered.
-            # wait_for_function loses context across the Microsoft redirect chain,
-            # so we poll manually with page.evaluate() which is always fresh.
+            # Poll using Playwright's Python-side properties — no JS evaluation
+            # needed, so mid-navigation exceptions can't swallow detection.
+            _OWA_DOMAINS = ('webmail.medtronic.com', 'outlook.cloud.microsoft',
+                            'outlook.office365.com', 'outlook.office.com')
+            _AUTH_PATHS  = ('/auth/', '/logon', '/login', '/sso', '/saml', '/adfs/')
+            _SIGNIN_RE   = re.compile(r'sign.?in|authenticat|verif|two.?factor|mfa', re.I)
+
             deadline = time.time() + 300
             logged_in = False
             while time.time() < deadline:
                 try:
-                    if page.evaluate(_LOGIN_DONE_JS):
+                    url   = page.url
+                    title = page.title()
+                    if (any(d in url for d in _OWA_DOMAINS) and
+                            '/mail' in url and
+                            not any(p in url for p in _AUTH_PATHS) and
+                            not _SIGNIN_RE.search(title)):
                         logged_in = True
                         break
                 except Exception:
-                    pass  # page is mid-navigation; keep polling
+                    pass
                 time.sleep(1.5)
 
             if not logged_in:
