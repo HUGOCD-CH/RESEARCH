@@ -1,22 +1,21 @@
 """
 Browser session manager using Playwright.
 
-Keeps a real browser window open and routes all mail API calls through
-it via page.evaluate(). This means auth happens exactly as it does
-when the user browses webmail.medtronic.com normally — no token
-extraction or app registration needed.
-
-Thread safety: Playwright's sync API must be called from the thread that
-created the browser. A dedicated daemon thread owns the browser and
-processes tasks from a queue so Flask worker threads never touch
-Playwright directly.
+Key design choices:
+- Persistent browser context (.playwright_session/) saves cookies/session
+  so MFA is only required once per corporate session expiry (~8-24 h).
+- Login detection only completes when webmail.medtronic.com is fully
+  loaded and past all auth/MFA redirect chains.
+- Keep-alive tolerates brief navigation pauses before reporting closure.
 """
+import os
 import queue
 import threading
 import config
 
+_SESSION_DIR = os.path.join(os.path.dirname(__file__), ".playwright_session")
+
 # ── Shared state ─────────────────────────────────────────────────────────────
-# status: idle | opening | waiting_login | active | error
 _state: dict = {"status": "idle", "error": None, "user": None}
 _state_lock = threading.Lock()
 _task_queue: queue.Queue | None = None
@@ -55,10 +54,7 @@ class _Task:
 
 
 def evaluate(js: str, timeout: float = 30):
-    """
-    Run JavaScript in the live browser window and return the result.
-    Called from Flask worker threads; the browser thread executes it.
-    """
+    """Run JavaScript in the browser from any Flask worker thread."""
     if not is_ready():
         raise RuntimeError("Browser session is not active. Please sign in again.")
     task = _Task(js)
@@ -70,6 +66,38 @@ def evaluate(js: str, timeout: float = 30):
     return task.result
 
 
+# ── Login detection ───────────────────────────────────────────────────────────
+# Fires only when OWA's inbox is fully rendered at webmail.medtronic.com,
+# NOT during Microsoft's auth/MFA redirect chain.
+
+_LOGIN_DONE_JS = """() => {
+    const url  = window.location.href;
+    const title = document.title || '';
+
+    // Must be on the actual OWA server
+    if (!url.includes('webmail.medtronic.com')) return false;
+
+    // Reject if still on an auth/redirect/MFA page at this domain
+    if (url.includes('/auth/')   ||
+        url.includes('/logon')   ||
+        url.includes('/login')   ||
+        url.includes('/sso')     ||
+        url.includes('/saml')    ||
+        url.includes('/adfs/')) return false;
+
+    // Reject pages whose <title> still says sign-in / authentication
+    if (/sign.?in|authenticat|verification|two.?factor|mfa/i.test(title))
+        return false;
+
+    // Page must be fully loaded
+    if (document.readyState !== 'complete') return false;
+
+    // OWA inbox has a non-empty [role="main"] or an #app with children
+    const main = document.querySelector('[role="main"], #app');
+    return !!main && main.children.length > 0;
+}"""
+
+
 # ── Browser worker thread ─────────────────────────────────────────────────────
 
 def _worker(q: queue.Queue):
@@ -79,80 +107,88 @@ def _worker(q: queue.Queue):
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
         with sync_playwright() as pw:
-            # Prefer installed Chrome (better corporate SSO); fall back to Chromium
-            try:
-                browser = pw.chromium.launch(headless=False, channel="chrome")
-            except Exception:
-                browser = pw.chromium.launch(headless=False)
+            os.makedirs(_SESSION_DIR, exist_ok=True)
 
-            context = browser.new_context(ignore_https_errors=True)
-            page = context.new_page()
+            # launch_persistent_context saves cookies + localStorage between runs.
+            # After the first MFA, subsequent launches restore the session
+            # automatically (no re-authentication unless the session expires).
+            launch_kwargs = dict(
+                headless=False,
+                ignore_https_errors=True,
+                args=["--no-first-run", "--no-default-browser-check"],
+            )
+            try:
+                context = pw.chromium.launch_persistent_context(
+                    _SESSION_DIR, channel="chrome", **launch_kwargs
+                )
+            except Exception:
+                # Chrome not installed — fall back to bundled Chromium
+                context = pw.chromium.launch_persistent_context(
+                    _SESSION_DIR, **launch_kwargs
+                )
+
+            # Re-use existing page if one was saved; otherwise open a new one
+            page = context.pages[0] if context.pages else context.new_page()
 
             _set(status="waiting_login")
             page.goto(config.OWA_URL, wait_until="domcontentloaded", timeout=30_000)
 
-            # Wait until the user has passed the login page
+            # Wait until OWA inbox is fully rendered (survives MFA redirects)
             try:
-                page.wait_for_function(
-                    """() => {
-                        const url = window.location.href.toLowerCase();
-                        const pastLogin = !url.includes('logon') &&
-                                          !url.includes('/login') &&
-                                          !url.includes('sso');
-                        const hasApp = !!document.querySelector(
-                            '#app, [role="main"], [aria-label="Inbox"]'
-                        );
-                        return pastLogin && hasApp;
-                    }""",
-                    timeout=300_000,   # 5-minute login window
-                )
+                page.wait_for_function(_LOGIN_DONE_JS, timeout=300_000)
             except PWTimeout:
                 _set(status="error", error="Login timed out. Please try again.")
-                browser.close()
+                context.close()
                 return
 
-            # Let OWA finish loading
-            page.wait_for_timeout(2_500)
+            # Let any final rendering settle
+            page.wait_for_timeout(2_000)
 
-            # Best-effort: read the signed-in user's email from the page
+            # Best-effort: read signed-in user from OWA's page
             user = page.evaluate("""() => {
                 try {
                     return (
-                        document.querySelector('[aria-label*="@medtronic"]')
+                        document.querySelector('[aria-label*="@"]')
                             ?.getAttribute('aria-label') ||
-                        document.querySelector('[title*="@medtronic"]')
-                            ?.getAttribute('title') ||
-                        document.cookie.match(/hpn=([^;]+)/)?.[1] || ''
+                        document.querySelector('[title*="@"]')
+                            ?.getAttribute('title') || ''
                     );
                 } catch(e) { return ''; }
             }""")
 
             _set(status="active", user=user or "")
 
-            # ── Main task loop ────────────────────────────────────────────────
+            # ── Main task loop ────────────────────────────────────────────
+            consecutive_nav_errors = 0
+
             while True:
                 try:
                     task: _Task | None = q.get(timeout=1)
                 except queue.Empty:
-                    # Keep-alive: verify the page is still responsive
+                    # Keep-alive: distinguish navigation (transient) from closure
                     try:
-                        page.evaluate("() => document.readyState")
+                        page.evaluate("() => true")
+                        consecutive_nav_errors = 0
                     except Exception:
-                        _set(status="error",
-                             error="Browser was closed. Please sign in again.")
-                        break
+                        consecutive_nav_errors += 1
+                        # Allow up to ~8 s of navigation before treating as closed
+                        if consecutive_nav_errors >= 8:
+                            _set(status="error",
+                                 error="Browser was closed. Please sign in again.")
+                            break
                     continue
 
                 if task is None:   # shutdown signal
                     break
 
+                consecutive_nav_errors = 0
                 try:
                     task.complete(result=page.evaluate(task.js))
                 except Exception as exc:
                     task.complete(error=str(exc))
 
             try:
-                browser.close()
+                context.close()
             except Exception:
                 pass
 
@@ -165,7 +201,7 @@ def _worker(q: queue.Queue):
 def start_login():
     global _task_queue
     if _task_queue:
-        _task_queue.put(None)   # stop any existing browser thread
+        _task_queue.put(None)   # stop any existing browser
 
     _task_queue = queue.Queue()
     _set(status="idle", error=None, user=None)
