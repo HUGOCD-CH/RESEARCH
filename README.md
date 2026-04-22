@@ -1,86 +1,93 @@
 # Outlook Local Viewer
 
-A lightweight local web app to read your corporate Outlook emails at `http://localhost:5000` — no Azure app registration or IT admin approval required.
+A lightweight local web app to read your Medtronic/Microsoft 365 emails at `http://localhost:5000`.
 
-It connects directly to your company's Exchange server via **Exchange Web Services (EWS)** using your regular email and password. Nothing is stored on disk except a `.env` file you create yourself.
-
-## How it works
-
-- Runs at `http://localhost:5000` — only your computer can access it
-- You log in with your corporate email and password via a local form
-- The app connects to `webmail.medtronic.com` using the Exchange Web Services protocol (the same protocol Outlook desktop uses)
-- Your password is held in memory only; it is never written to disk
-- Closes the connection when you sign out or stop the app
+Uses **OAuth2 Modern Authentication** (the same method used by Outlook desktop) — no basic-auth, no IT approval needed for the app itself. You sign in through Microsoft's own login page, which handles SSO, MFA, and Conditional Access automatically.
 
 ---
 
-## Setup (5 minutes)
+## How sign-in works (Device Code Flow)
 
-### Step 1 — Install Python 3
+1. You click "Sign in with Microsoft" in the app.
+2. The app shows a short code (e.g. `ABCD1234`) and a link to `https://microsoft.com/devicelogin`.
+3. You open that link in your browser, enter the code, and sign in with your Medtronic credentials — just like you would at `webmail.medtronic.com`.
+4. The app detects your completed sign-in and loads your inbox automatically.
 
-Python 3.9 or newer is required. Download it from [python.org](https://www.python.org/downloads/) if you don't have it.
+Your password never touches this app. Authentication goes directly between your browser and Microsoft.
 
-### Step 2 — Download or clone this project
+---
 
-If you have git:
-```bash
-git clone <repo-url>
-cd RESEARCH
-```
+## Step 1 — Register the app in Azure (one-time, ~5 minutes)
 
-Or download and extract the ZIP from GitHub.
+You register this app yourself using your own Medtronic account — no IT ticket needed.
 
-### Step 3 — Create a virtual environment and install dependencies
+> **Note:** Some Medtronic tenants may block self-registered apps from accessing mail. If sign-in succeeds but you get a "Need admin approval" screen, you will need to ask IT to consent to `Mail.Read` and `User.Read` for your registered app. These are read-only, delegated permissions (they only access your own mailbox).
 
-```bash
-python3 -m venv .venv
+1. Go to [https://portal.azure.com](https://portal.azure.com) and sign in with your Medtronic account.
 
-# Activate it:
-source .venv/bin/activate        # macOS / Linux
-.venv\Scripts\activate           # Windows (Command Prompt)
+2. Search for **App registrations** → **New registration**.
 
-pip install -r requirements.txt
-```
+3. Fill in:
+   - **Name**: `Outlook Local Viewer` (or anything you like)
+   - **Supported account types**: `Accounts in any organizational directory (Any Azure AD directory - Multitenant) and personal Microsoft accounts`
+   - **Redirect URI**: leave blank (device code flow does not need one)
+   - Click **Register**.
 
-### Step 4 — Configure
+4. On the Overview page, copy the **Application (client) ID** — you'll need it in Step 2.
+
+5. Click **Authentication** in the left menu:
+   - Under **Advanced settings**, set **Allow public client flows** → **Yes**
+   - Click **Save**
+
+6. Click **API permissions** → **Add a permission** → **Microsoft Graph** → **Delegated permissions**:
+   - Add `Mail.Read`
+   - Add `User.Read`
+   - Click **Add permissions**
+
+---
+
+## Step 2 — Configure
 
 ```bash
 cp .env.example .env
 ```
 
-Open `.env` in any text editor and set a random secret key:
+Open `.env` and fill in:
+- `AZURE_CLIENT_ID` — the client ID you copied in Step 1
+- `FLASK_SECRET_KEY` — generate one with:
 
 ```bash
-# Run this to generate a key, then paste the output into .env
 python3 -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-Your `.env` should look like:
-```
-EWS_SERVER=webmail.medtronic.com
-FLASK_SECRET_KEY=abc123...your-random-key-here
-```
+---
 
-### Step 5 — Run
+## Step 3 — Install and run
 
 ```bash
+# Create virtual environment
+python3 -m venv .venv
+
+# Activate it
+source .venv/bin/activate        # macOS / Linux
+.venv\Scripts\activate           # Windows
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run the app
 python3 app.py
 ```
 
-Open your browser and go to **http://localhost:5000**.
-
-Enter your corporate email (`you@medtronic.com`) and your Windows/Outlook password. The app will connect to the mail server and display your inbox.
+Open your browser at **http://localhost:5000** and click **Sign in with Microsoft**.
 
 ---
 
 ## Subsequent runs
 
-```bash
-source .venv/bin/activate   # if not already active
-python3 app.py
-```
+After the first sign-in, your token is saved to `token_cache.json`. The next time you run `python3 app.py`, you'll be taken directly to your inbox — no re-authentication needed (tokens refresh automatically for up to 90 days).
 
-You will need to sign in each time you start the app (no token is stored between runs).
+To force a fresh sign-in, delete `token_cache.json` or click **Sign out** in the app.
 
 ---
 
@@ -88,21 +95,20 @@ You will need to sign in each time you start the app (no token is stored between
 
 | Problem | Fix |
 |---|---|
-| `Could not connect to mail server` | Check you're on the corporate network or VPN. EWS is usually blocked from outside the network. |
-| `Invalid email or password` | Double-check your credentials. Try logging in to `https://webmail.medtronic.com` in a browser first to confirm they work. |
-| Port 5000 already in use (macOS) | AirPlay Receiver uses port 5000 on macOS Monterey+. Change `port=5000` in `app.py` to `5001` and restart. |
-| Slow initial connection | The first connection triggers autodiscovery (DNS lookups). Subsequent requests in the same session are faster. |
-| `KeyError: FLASK_SECRET_KEY` | You haven't created `.env` or it's missing the key. Re-run Step 4. |
+| "Need admin approval" screen during sign-in | Your tenant requires IT consent. Ask IT to approve `Mail.Read` + `User.Read` (delegated, read-only) for your app's client ID. |
+| `KeyError: AZURE_CLIENT_ID` | You haven't created `.env` or the client ID is missing. |
+| "Could not start device flow" | Double-check the client ID in `.env` and confirm "Allow public client flows" is enabled in Azure. |
+| Port 5000 already in use (macOS) | AirPlay Receiver uses port 5000. Change `port=5000` in `app.py` to `5001` and restart. |
+| Code expires before you enter it | The device code is valid for 15 minutes. Click "Sign in" again to get a new one. |
 
 ---
 
 ## Security notes
 
-- Your password is **never written to disk**. It lives in the Flask app's memory only and is cleared when you sign out or stop the server.
-- The `.env` file contains only your secret key — not your password.
-- HTML emails are rendered in a sandboxed `<iframe>` with JavaScript disabled, preventing malicious email content from executing code in your browser.
-- The app only binds to `127.0.0.1` (localhost) — it is not accessible from other devices on your network.
-- Stop the app (`Ctrl+C`) when you're done to clear credentials from memory.
+- Your password is entered at `https://microsoft.com/devicelogin` — a Microsoft-owned page. This app never sees it.
+- The access token and refresh token are saved locally to `token_cache.json` — git-ignored, never committed.
+- HTML emails render in a sandboxed `<iframe>` with JavaScript disabled.
+- The app only listens on `127.0.0.1` (localhost) — not accessible from other devices.
 
 ---
 
@@ -110,10 +116,10 @@ You will need to sign in each time you start the app (no token is stored between
 
 | File | Purpose |
 |---|---|
-| `app.py` | Flask web server and routes |
-| `auth.py` | EWS login and in-memory session management |
-| `mail.py` | Exchange Web Services API calls via `exchangelib` |
-| `config.py` | Configuration loaded from `.env` |
-| `templates/` | HTML page templates |
+| `app.py` | Flask routes: landing, device code flow, inbox, email view, logout |
+| `auth.py` | MSAL token cache, device code flow, background polling |
+| `mail.py` | Microsoft Graph API wrappers (list/read mail) |
+| `config.py` | Settings loaded from `.env` |
+| `templates/` | HTML templates |
 | `static/style.css` | Stylesheet |
-| `.env` | Your secret key (not committed to git) |
+| `token_cache.json` | Saved OAuth2 tokens (git-ignored) |

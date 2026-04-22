@@ -2,21 +2,8 @@
 {% block content %}
 <div class="landing">
   <h1>Outlook Local Viewer</h1>
-  <p>Sign in with your corporate email and password to read your inbox locally.</p>
-  <p>Your credentials are used only to connect to <strong>webmail.medtronic.com</strong> and are never stored on disk.</p>
-
-  {% if error %}
-  <p class="login-error">{{ error }}</p>
-  {% endif %}
-
-  <form class="login-form" method="post" action="{{ url_for('login') }}" autocomplete="on">
-    <label for="email">Email address</label>
-    <input id="email" name="email" type="email" placeholder="you@medtronic.com" required autofocus>
-
-    <label for="password">Password</label>
-    <input id="password" name="password" type="password" placeholder="Your password" required>
-
-    <button class="btn" type="submit">Sign in</button>
-  </form>
+  <p>Read your Medtronic emails locally, right in your browser.</p>
+  <p>Sign in via Microsoft's secure login — your password never touches this app.</p>
+  <a class="btn" href="{{ url_for('auth_start') }}">Sign in with Microsoft</a>
 </div>
 {% endblock %}

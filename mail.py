@@ -1,39 +1,55 @@
-from exchangelib.items import Message, HTMLBody
+import requests
 import config
 
-_LIST_FIELDS = (
-    "id",
-    "changekey",
-    "subject",
-    "sender",
-    "datetime_received",
-    "is_read",
-)
 
-
-def get_messages(account, skip: int = 0, top: int = config.MESSAGES_PER_PAGE):
-    items = (
-        account.inbox.only(*_LIST_FIELDS)
-        .order_by("-datetime_received")[skip : skip + top]
+def _get(token, path, params=None):
+    resp = requests.get(
+        config.GRAPH_BASE + path,
+        headers={"Authorization": f"Bearer {token}"},
+        params=params,
     )
-    return list(items)
+    resp.raise_for_status()
+    return resp.json()
 
 
-def get_message(account, item_id: str, changekey: str):
-    msg = Message(item_id=item_id, changekey=changekey, account=account)
-    msg.refresh()
-    return msg
+def _patch(token, path, body):
+    resp = requests.patch(
+        config.GRAPH_BASE + path,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json=body,
+    )
+    resp.raise_for_status()
 
 
-def mark_as_read(msg):
-    if not msg.is_read:
-        msg.is_read = True
-        msg.save(update_fields=["is_read"])
+def get_user_profile(token):
+    return _get(token, "/me", params={"$select": "displayName,mail,userPrincipalName"})
 
 
-def body_parts(msg):
-    """Return (body_content: str, body_is_html: bool)."""
-    body = msg.body
-    if body is None:
-        return "", False
-    return str(body), isinstance(body, HTMLBody)
+def get_messages(token, top=config.MESSAGES_PER_PAGE, skip=0):
+    return _get(
+        token,
+        "/me/mailFolders/inbox/messages",
+        params={
+            "$select": "id,subject,from,receivedDateTime,isRead,bodyPreview",
+            "$orderby": "receivedDateTime desc",
+            "$top": top,
+            "$skip": skip,
+        },
+    )
+
+
+def get_message(token, message_id):
+    return _get(
+        token,
+        f"/me/messages/{message_id}",
+        params={
+            "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,isRead"
+        },
+    )
+
+
+def mark_as_read(token, message_id):
+    _patch(token, f"/me/messages/{message_id}", {"isRead": True})

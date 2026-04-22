@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="landing">
+  <h1>Sign in with Microsoft</h1>
+  <p>Open the link below in your browser, then enter the code shown.</p>
+
+  <div class="device-code-box">
+    <p class="code-label">Your code</p>
+    <p class="code">{{ user_code }}</p>
+    <a class="btn" href="{{ verification_uri }}" target="_blank" rel="noopener">
+      Open Microsoft login &rarr;
+    </a>
+    <p class="code-hint">or go to <strong>{{ verification_uri }}</strong></p>
+  </div>
+
+  <p id="status-msg" class="status-msg">Waiting for you to sign in&hellip;</p>
+  <div class="spinner"></div>
+</div>
+
+<script>
+(function poll() {
+  fetch("{{ url_for('auth_poll') }}")
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.status === "done") {
+        document.getElementById("status-msg").textContent = "Signed in! Redirecting…";
+        window.location.href = "{{ url_for('inbox') }}";
+      } else if (data.status === "error") {
+        document.getElementById("status-msg").textContent =
+          "Error: " + (data.error || "Authentication failed. Please refresh and try again.");
+        document.querySelector(".spinner").style.display = "none";
+      } else {
+        setTimeout(poll, 3000);
+      }
+    })
+    .catch(function() { setTimeout(poll, 5000); });
+})();
+</script>
+{% endblock %}

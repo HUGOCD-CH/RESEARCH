@@ -3,42 +3,41 @@
 <div class="email-header">
   <a class="btn btn-sm back-link" href="{{ url_for('inbox') }}">&larr; Back to Inbox</a>
 
-  <h2 class="email-subject">{{ message.subject or '(no subject)' }}</h2>
+  <h2 class="email-subject">{{ message.get('subject') or '(no subject)' }}</h2>
 
   <dl class="email-meta">
+    {% set sender = message.get('from', {}).get('emailAddress', {}) %}
     <dt>From</dt>
     <dd>
-      {% if message.sender %}
-        {% if message.sender.name %}
-          {{ message.sender.name }} &lt;{{ message.sender.email_address }}&gt;
-        {% else %}
-          {{ message.sender.email_address }}
-        {% endif %}
+      {% if sender.get('name') %}
+        {{ sender['name'] }} &lt;{{ sender.get('address', '') }}&gt;
+      {% else %}
+        {{ sender.get('address', '') }}
       {% endif %}
     </dd>
 
-    {% if message.to_recipients %}
+    {% set recipients = message.get('toRecipients', []) %}
+    {% if recipients %}
     <dt>To</dt>
     <dd>
-      {% for r in message.to_recipients %}
-        {{ r.name or r.email_address }}{% if not loop.last %}, {% endif %}
+      {% for r in recipients %}
+        {{ r.get('emailAddress', {}).get('name') or r.get('emailAddress', {}).get('address', '') }}{% if not loop.last %}, {% endif %}
       {% endfor %}
     </dd>
     {% endif %}
 
-    {% if message.cc_recipients %}
+    {% set cc = message.get('ccRecipients', []) %}
+    {% if cc %}
     <dt>Cc</dt>
     <dd>
-      {% for r in message.cc_recipients %}
-        {{ r.name or r.email_address }}{% if not loop.last %}, {% endif %}
+      {% for r in cc %}
+        {{ r.get('emailAddress', {}).get('name') or r.get('emailAddress', {}).get('address', '') }}{% if not loop.last %}, {% endif %}
       {% endfor %}
     </dd>
     {% endif %}
 
-    {% if message.datetime_received %}
     <dt>Date</dt>
-    <dd>{{ message.datetime_received.strftime('%Y-%m-%d %H:%M') }} UTC</dd>
-    {% endif %}
+    <dd>{{ message.get('receivedDateTime', '')[:19].replace('T', ' ') }} UTC</dd>
   </dl>
 </div>
 
