@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="landing">
+  <h1>Sign in to Webmail</h1>
+
+  <div class="device-code-box">
+    <p style="font-size:1rem;color:#333;margin-bottom:0.5rem;">
+      A browser window has opened to <strong>webmail.medtronic.com</strong>.
+    </p>
+    <ol style="text-align:left;margin:0.75rem 1.5rem;color:#444;line-height:1.8;">
+      <li>Sign in with your Medtronic credentials in that window.</li>
+      <li>Wait for your inbox to fully load (a few seconds).</li>
+      <li>This page will redirect automatically.</li>
+    </ol>
+  </div>
+
+  <p id="status-msg" class="status-msg">Waiting for sign-in&hellip;</p>
+  <div class="spinner"></div>
+</div>
+
+<script>
+(function poll() {
+  fetch("{{ url_for('auth_poll') }}")
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var msg = document.getElementById("status-msg");
+      if (data.status === "done") {
+        msg.textContent = "Signed in" + (data.user ? " as " + data.user : "") + "! Loading inbox…";
+        window.location.href = "{{ url_for('inbox') }}";
+      } else if (data.status === "error") {
+        msg.textContent = data.error || "An error occurred.";
+        document.querySelector(".spinner").style.display = "none";
+        var btn = document.createElement("a");
+        btn.className = "btn";
+        btn.href = "{{ url_for('auth_start') }}";
+        btn.textContent = "Try again";
+        btn.style.marginTop = "1rem";
+        msg.after(btn);
+      } else if (data.status === "capturing") {
+        msg.textContent = "Signed in — capturing session token…";
+        setTimeout(poll, 1500);
+      } else {
+        setTimeout(poll, 2500);
+      }
+    })
+    .catch(function() { setTimeout(poll, 4000); });
+})();
+</script>
+{% endblock %}

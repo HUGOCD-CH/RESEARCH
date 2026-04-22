@@ -2,8 +2,15 @@
 {% block content %}
 <div class="landing">
   <h1>Outlook Local Viewer</h1>
-  <p>Read your Medtronic emails locally, right in your browser.</p>
-  <p>Sign in via Microsoft's secure login — your password never touches this app.</p>
-  <a class="btn" href="{{ url_for('auth_start') }}">Sign in with Microsoft</a>
+  <p>Read your Medtronic emails locally, with no Azure registration or IT approval required.</p>
+
+  {% if state and state.status == 'error' %}
+  <p class="login-error">{{ state.error }}</p>
+  {% endif %}
+
+  <p>Clicking the button below opens a browser window to <strong>webmail.medtronic.com</strong>.
+     Sign in there as normal — the app captures your session token automatically.</p>
+
+  <a class="btn" href="{{ url_for('auth_start') }}">Open Webmail &amp; Sign In</a>
 </div>
 {% endblock %}

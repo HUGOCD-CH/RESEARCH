@@ -1,5 +1,4 @@
-import uuid
-from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+from flask import Flask, jsonify, redirect, render_template, request, url_for
 import auth
 import config
 import mail
@@ -9,54 +8,49 @@ app.secret_key = config.SECRET_KEY
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 
-def _require_token():
+def _require_auth():
+    """Return (token, api_base, None) or (None, None, redirect)."""
     token = auth.get_token()
     if not token:
-        return None, redirect(url_for("index"))
-    return token, None
+        return None, None, redirect(url_for("index"))
+    return token, auth.get_api_base(), None
+
+
+def _token_expired(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "401" in msg or "unauthorized" in msg or "token" in msg
 
 
 @app.route("/")
 def index():
-    if auth.get_token():
+    state = auth.get_state()
+    if state["status"] == "done" and state.get("token"):
         return redirect(url_for("inbox"))
-    return render_template("index.html")
+    return render_template("index.html", state=state)
 
 
-# ── Device code flow ─────────────────────────────────────────────────────────
+# ── Auth flow ─────────────────────────────────────────────────────────────────
 
 @app.route("/auth/start")
 def auth_start():
-    try:
-        flow = auth.start_device_flow()
-    except RuntimeError as exc:
-        return render_template("error.html", message=str(exc))
-
-    poll_id = str(uuid.uuid4())
-    auth.start_polling(flow, poll_id)
-    session["poll_id"] = poll_id
-
-    return render_template(
-        "device_code.html",
-        user_code=flow["user_code"],
-        verification_uri=flow["verification_uri"],
-        expires_in=flow.get("expires_in", 900),
-    )
+    auth.start_login()
+    return render_template("waiting.html")
 
 
 @app.route("/auth/poll")
 def auth_poll():
-    """AJAX endpoint polled by the device-code page every few seconds."""
-    poll_id = session.get("poll_id")
-    if not poll_id:
-        return jsonify({"status": "error", "error": "No pending sign-in."}), 400
-    return jsonify(auth.check_poll(poll_id))
+    """AJAX endpoint polled by the waiting page."""
+    state = auth.get_state()
+    return jsonify({
+        "status": state["status"],
+        "error":  state.get("error"),
+        "user":   state.get("user"),
+    })
 
 
 @app.route("/auth/logout")
 def logout():
-    session.clear()
-    auth.clear_cache()
+    auth.clear()
     return redirect(url_for("index"))
 
 
@@ -64,42 +58,47 @@ def logout():
 
 @app.route("/inbox")
 def inbox():
-    token, redir = _require_token()
+    token, api_base, redir = _require_auth()
     if redir:
         return redir
 
-    page = max(int(request.args.get("page", 1)), 1)
-    skip = (page - 1) * config.MESSAGES_PER_PAGE
+    page_num = max(int(request.args.get("page", 1)), 1)
+    skip = (page_num - 1) * config.MESSAGES_PER_PAGE
 
     try:
-        data = mail.get_messages(token, top=config.MESSAGES_PER_PAGE, skip=skip)
-        user = mail.get_user_profile(token)
+        data = mail.get_messages(token, api_base, top=config.MESSAGES_PER_PAGE, skip=skip)
+        user = mail.get_user_profile(token, api_base)
     except Exception as exc:
+        if _token_expired(exc):
+            auth.clear()
+            return redirect(url_for("index"))
         return render_template("error.html", message=str(exc))
 
     messages = data.get("value", [])
     return render_template(
         "inbox.html",
         messages=messages,
-        page=page,
+        page=page_num,
         has_next="@odata.nextLink" in data or len(messages) == config.MESSAGES_PER_PAGE,
-        has_prev=page > 1,
+        has_prev=page_num > 1,
         user=user,
     )
 
 
 @app.route("/email/<message_id>")
 def view_email(message_id):
-    token, redir = _require_token()
+    token, api_base, redir = _require_auth()
     if redir:
         return redir
 
     try:
-        message = mail.get_message(token, message_id)
-        user = mail.get_user_profile(token)
-        if not message.get("isRead"):
-            mail.mark_as_read(token, message_id)
+        message = mail.get_message(token, api_base, message_id)
+        user = mail.get_user_profile(token, api_base)
+        mail.mark_as_read(token, api_base, message_id)
     except Exception as exc:
+        if _token_expired(exc):
+            auth.clear()
+            return redirect(url_for("index"))
         return render_template("error.html", message=str(exc))
 
     body = message.get("body", {})
@@ -113,4 +112,4 @@ def view_email(message_id):
 
 
 if __name__ == "__main__":
-    app.run(debug=False, port=5000)
+    app.run(debug=False, port=5000, threaded=True)
