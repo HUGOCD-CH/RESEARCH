@@ -4,8 +4,8 @@ Browser session manager using Playwright.
 Key design choices:
 - Persistent browser context (.playwright_session/) saves cookies/session
   so MFA is only required once per corporate session expiry (~8-24 h).
-- Login detection only completes when webmail.medtronic.com is fully
-  loaded and past all auth/MFA redirect chains.
+- Login detection completes when OWA inbox is fully loaded (handles
+  redirect from webmail.medtronic.com → outlook.cloud.microsoft).
 - Keep-alive tolerates brief navigation pauses before reporting closure.
 """
 import os
@@ -67,17 +67,21 @@ def evaluate(js: str, timeout: float = 30):
 
 
 # ── Login detection ───────────────────────────────────────────────────────────
-# Fires only when OWA's inbox is fully rendered at webmail.medtronic.com,
-# NOT during Microsoft's auth/MFA redirect chain.
+# Fires only when OWA's inbox is fully rendered, NOT during the auth/MFA chain.
+# Accepts both webmail.medtronic.com and outlook.cloud.microsoft (redirect target).
 
 _LOGIN_DONE_JS = """() => {
     const url  = window.location.href;
     const title = document.title || '';
 
-    // Must be on the actual OWA server
-    if (!url.includes('webmail.medtronic.com')) return false;
+    // Must be on the actual OWA server (Medtronic redirects to outlook.cloud.microsoft)
+    const onOWA = url.includes('webmail.medtronic.com') ||
+                  url.includes('outlook.cloud.microsoft') ||
+                  url.includes('outlook.office365.com') ||
+                  url.includes('outlook.office.com');
+    if (!onOWA) return false;
 
-    // Reject if still on an auth/redirect/MFA page at this domain
+    // Reject if still on an auth/redirect/MFA page
     if (url.includes('/auth/')   ||
         url.includes('/logon')   ||
         url.includes('/login')   ||
