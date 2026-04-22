@@ -156,18 +156,27 @@ def _worker(q: queue.Queue):
 
             deadline = time.time() + 300
             logged_in = False
+            last_url = ""
             while time.time() < deadline:
                 try:
                     url   = page.url
                     title = page.title()
-                    if (any(d in url for d in _OWA_DOMAINS) and
-                            '/mail' in url and
-                            not any(p in url for p in _AUTH_PATHS) and
-                            not _SIGNIN_RE.search(title)):
+                    if url != last_url:
+                        print(f"[auth] url={url!r}  title={title!r}", flush=True)
+                        last_url = url
+                    ok_domain = any(d in url for d in _OWA_DOMAINS)
+                    ok_path   = '/mail' in url
+                    ok_noauth = not any(p in url for p in _AUTH_PATHS)
+                    ok_title  = not _SIGNIN_RE.search(title)
+                    if ok_domain and ok_path and ok_noauth and ok_title:
+                        print(f"[auth] LOGIN DETECTED", flush=True)
                         logged_in = True
                         break
-                except Exception:
-                    pass
+                    if ok_domain and url != last_url:
+                        print(f"[auth]   checks: domain={ok_domain} path={ok_path} "
+                              f"noauth={ok_noauth} title_ok={ok_title}", flush=True)
+                except Exception as exc:
+                    print(f"[auth] poll error: {exc}", flush=True)
                 time.sleep(1.5)
 
             if not logged_in:
