@@ -11,6 +11,7 @@ Key design choices:
 import os
 import queue
 import threading
+import time
 import config
 
 _SESSION_DIR = os.path.join(os.path.dirname(__file__), ".playwright_session")
@@ -108,7 +109,7 @@ def _worker(q: queue.Queue):
     _set(status="opening", error=None, user=None)
 
     try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+        from playwright.sync_api import sync_playwright
 
         with sync_playwright() as pw:
             os.makedirs(_SESSION_DIR, exist_ok=True)
@@ -140,12 +141,26 @@ def _worker(q: queue.Queue):
             page = context.pages[0] if context.pages else context.new_page()
 
             _set(status="waiting_login")
-            page.goto(config.OWA_URL, wait_until="domcontentloaded", timeout=30_000)
-
-            # Wait until OWA inbox is fully rendered (survives MFA redirects)
             try:
-                page.wait_for_function(_LOGIN_DONE_JS, timeout=300_000)
-            except PWTimeout:
+                page.goto(config.OWA_URL, wait_until="domcontentloaded", timeout=30_000)
+            except Exception:
+                pass  # redirect chain may exceed domcontentloaded; keep going
+
+            # Poll until OWA inbox is fully rendered.
+            # wait_for_function loses context across the Microsoft redirect chain,
+            # so we poll manually with page.evaluate() which is always fresh.
+            deadline = time.time() + 300
+            logged_in = False
+            while time.time() < deadline:
+                try:
+                    if page.evaluate(_LOGIN_DONE_JS):
+                        logged_in = True
+                        break
+                except Exception:
+                    pass  # page is mid-navigation; keep polling
+                time.sleep(1.5)
+
+            if not logged_in:
                 _set(status="error", error="Login timed out. Please try again.")
                 context.close()
                 return
