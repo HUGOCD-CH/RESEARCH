@@ -74,14 +74,14 @@ _LOGIN_DONE_JS = """() => {
     const url  = window.location.href;
     const title = document.title || '';
 
-    // Must be on the actual OWA server (Medtronic redirects to outlook.cloud.microsoft)
+    // Must be on an OWA server (Medtronic redirects to outlook.office365.com)
     const onOWA = url.includes('webmail.medtronic.com') ||
                   url.includes('outlook.cloud.microsoft') ||
                   url.includes('outlook.office365.com') ||
                   url.includes('outlook.office.com');
     if (!onOWA) return false;
 
-    // Reject if still on an auth/redirect/MFA page
+    // Reject auth/MFA/redirect paths
     if (url.includes('/auth/')   ||
         url.includes('/logon')   ||
         url.includes('/login')   ||
@@ -93,12 +93,12 @@ _LOGIN_DONE_JS = """() => {
     if (/sign.?in|authenticat|verification|two.?factor|mfa/i.test(title))
         return false;
 
-    // Page must be fully loaded
+    // Page must be fully loaded and on the /mail section
     if (document.readyState !== 'complete') return false;
+    if (!url.includes('/mail')) return false;
 
-    // OWA inbox has a non-empty [role="main"] or an #app with children
-    const main = document.querySelector('[role="main"], #app');
-    return !!main && main.children.length > 0;
+    // Any rendered page body is enough — new Outlook doesn't use [role="main"]
+    return !!document.body && document.body.children.length > 0;
 }"""
 
 
@@ -130,6 +130,11 @@ def _worker(q: queue.Queue):
                 context = pw.chromium.launch_persistent_context(
                     _SESSION_DIR, **launch_kwargs
                 )
+
+            # Suppress "Open email links" / protocol-handler permission dialog.
+            # Outlook calls navigator.registerProtocolHandler(); this no-ops it
+            # so Chrome never shows the dialog (and Windows never opens Default Apps).
+            context.add_init_script("navigator.registerProtocolHandler = () => {};")
 
             # Re-use existing page if one was saved; otherwise open a new one
             page = context.pages[0] if context.pages else context.new_page()
