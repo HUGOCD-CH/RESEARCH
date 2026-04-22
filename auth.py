@@ -1,207 +1,180 @@
 """
-Browser-based authentication via Playwright.
+Browser session manager using Playwright.
 
-Opens a real Chrome/Chromium browser to webmail.medtronic.com and intercepts
-the Bearer tokens that OWA's own JavaScript sends to graph.microsoft.com.
-No Azure app registration or IT approval required.
+Keeps a real browser window open and routes all mail API calls through
+it via page.evaluate(). This means auth happens exactly as it does
+when the user browses webmail.medtronic.com normally — no token
+extraction or app registration needed.
+
+Thread safety: Playwright's sync API must be called from the thread that
+created the browser. A dedicated daemon thread owns the browser and
+processes tasks from a queue so Flask worker threads never touch
+Playwright directly.
 """
-import base64
-import json
+import queue
 import threading
-import time
-
-import requests
 import config
 
-# ── Shared auth state ────────────────────────────────────────────────────────
-# status: idle | opening | waiting_login | capturing | done | error
-_state: dict = {"status": "idle", "token": None, "api_base": None, "error": None, "user": None}
-_lock = threading.Lock()
+# ── Shared state ─────────────────────────────────────────────────────────────
+# status: idle | opening | waiting_login | active | error
+_state: dict = {"status": "idle", "error": None, "user": None}
+_state_lock = threading.Lock()
+_task_queue: queue.Queue | None = None
 
 
-def _update(**kwargs):
-    with _lock:
+def _set(**kwargs):
+    with _state_lock:
         _state.update(kwargs)
 
 
 def get_state() -> dict:
-    with _lock:
+    with _state_lock:
         return dict(_state)
 
 
-def get_token() -> str | None:
-    return get_state().get("token")
+def is_ready() -> bool:
+    return get_state()["status"] == "active"
 
 
-def get_api_base() -> str:
-    return get_state().get("api_base") or config.GRAPH_BASE
+# ── Task execution ────────────────────────────────────────────────────────────
+
+class _Task:
+    def __init__(self, js: str):
+        self.js = js
+        self.result = None
+        self.error: str | None = None
+        self._done = threading.Event()
+
+    def wait(self, timeout: float = 30) -> bool:
+        return self._done.wait(timeout)
+
+    def complete(self, result=None, error: str | None = None):
+        self.result = result
+        self.error = error
+        self._done.set()
 
 
-# ── JWT helpers ──────────────────────────────────────────────────────────────
-
-def _jwt_audience(token: str) -> str:
-    """Decode the JWT payload (no signature verification) and return the 'aud' claim."""
-    try:
-        payload_b64 = token.split(".")[1]
-        payload_b64 += "=" * (-len(payload_b64) % 4)  # fix padding
-        return json.loads(base64.b64decode(payload_b64)).get("aud", "")
-    except Exception:
-        return ""
-
-
-def _jwt_upn(token: str) -> str:
-    try:
-        payload_b64 = token.split(".")[1]
-        payload_b64 += "=" * (-len(payload_b64) % 4)
-        data = json.loads(base64.b64decode(payload_b64))
-        return data.get("upn") or data.get("preferred_username") or data.get("email", "")
-    except Exception:
-        return ""
-
-
-# ── Token verification ───────────────────────────────────────────────────────
-
-_CANDIDATE_BASES = [
-    "https://graph.microsoft.com/v1.0",
-    "https://outlook.office.com/api/v2.0",
-    "https://outlook.office365.com/api/v2.0",
-]
-
-
-def _verify_token(token: str) -> str | None:
+def evaluate(js: str, timeout: float = 30):
     """
-    Try the token against known Microsoft mail API bases.
-    Returns the working base URL, or None if the token doesn't work anywhere.
+    Run JavaScript in the live browser window and return the result.
+    Called from Flask worker threads; the browser thread executes it.
     """
-    aud = _jwt_audience(token)
-
-    # Prefer the API that matches the token's audience
-    if "graph.microsoft.com" in aud:
-        ordered = _CANDIDATE_BASES
-    else:
-        ordered = _CANDIDATE_BASES[1:] + [_CANDIDATE_BASES[0]]
-
-    for base in ordered:
-        try:
-            r = requests.get(
-                f"{base}/me/messages?$top=1&$select=id",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=10,
-            )
-            if r.status_code == 200:
-                return base
-        except Exception:
-            continue
-    return None
+    if not is_ready():
+        raise RuntimeError("Browser session is not active. Please sign in again.")
+    task = _Task(js)
+    _task_queue.put(task)
+    if not task.wait(timeout):
+        raise TimeoutError("Browser task timed out after %ds" % timeout)
+    if task.error:
+        raise RuntimeError(task.error)
+    return task.result
 
 
-# ── Playwright browser worker ────────────────────────────────────────────────
+# ── Browser worker thread ─────────────────────────────────────────────────────
 
-def _browser_worker():
-    _update(status="opening", token=None, api_base=None, error=None, user=None)
-
-    # Candidates keyed by which Microsoft host the request was sent to
-    captured: dict[str, str] = {}  # host_key -> token
-
-    def _on_request(request):
-        auth = request.headers.get("authorization", "")
-        if not auth.startswith("Bearer "):
-            return
-        token = auth[7:]
-        url = request.url
-        for host_key, fragment in [
-            ("graph", "graph.microsoft.com"),
-            ("office365", "outlook.office365.com"),
-            ("office", "outlook.office.com"),
-            ("substrate", "substrate.office.com"),
-        ]:
-            if fragment in url and host_key not in captured:
-                captured[host_key] = token
+def _worker(q: queue.Queue):
+    _set(status="opening", error=None, user=None)
 
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
         with sync_playwright() as pw:
-            # Prefer Chrome for corporate SSO; fall back to bundled Chromium
+            # Prefer installed Chrome (better corporate SSO); fall back to Chromium
             try:
                 browser = pw.chromium.launch(headless=False, channel="chrome")
             except Exception:
                 browser = pw.chromium.launch(headless=False)
 
-            # ignore_https_errors bypasses corporate SSL-inspection cert errors.
-            # Medtronic's proxy re-signs traffic with its own root CA which is
-            # trusted by Windows/Chrome but not by Playwright's bundled Chromium.
             context = browser.new_context(ignore_https_errors=True)
-            context.on("request", _on_request)
             page = context.new_page()
 
-            _update(status="waiting_login")
+            _set(status="waiting_login")
             page.goto(config.OWA_URL, wait_until="domcontentloaded", timeout=30_000)
 
-            # Wait until the user is past the login page (OWA inbox loaded)
+            # Wait until the user has passed the login page
             try:
                 page.wait_for_function(
                     """() => {
-                        const url = window.location.href;
-                        const notLogin = !url.toLowerCase().includes('logon') &&
-                                         !url.toLowerCase().includes('login') &&
-                                         !url.toLowerCase().includes('sso');
-                        const hasContent = document.querySelector(
-                            '[role="main"], [aria-label="Message list"], #app'
-                        ) !== null;
-                        return notLogin && hasContent;
+                        const url = window.location.href.toLowerCase();
+                        const pastLogin = !url.includes('logon') &&
+                                          !url.includes('/login') &&
+                                          !url.includes('sso');
+                        const hasApp = !!document.querySelector(
+                            '#app, [role="main"], [aria-label="Inbox"]'
+                        );
+                        return pastLogin && hasApp;
                     }""",
-                    timeout=300_000,  # 5-minute login window
+                    timeout=300_000,   # 5-minute login window
                 )
             except PWTimeout:
-                _update(status="error", error="Login timed out. Please try again.")
+                _set(status="error", error="Login timed out. Please try again.")
                 browser.close()
                 return
 
-            # Give OWA a moment to fire its initial API requests
-            _update(status="capturing")
-            page.wait_for_timeout(4_000)
+            # Let OWA finish loading
+            page.wait_for_timeout(2_500)
 
-            # If no token yet, scroll or hover to trigger mail API calls
-            if not captured:
+            # Best-effort: read the signed-in user's email from the page
+            user = page.evaluate("""() => {
+                try {
+                    return (
+                        document.querySelector('[aria-label*="@medtronic"]')
+                            ?.getAttribute('aria-label') ||
+                        document.querySelector('[title*="@medtronic"]')
+                            ?.getAttribute('title') ||
+                        document.cookie.match(/hpn=([^;]+)/)?.[1] || ''
+                    );
+                } catch(e) { return ''; }
+            }""")
+
+            _set(status="active", user=user or "")
+
+            # ── Main task loop ────────────────────────────────────────────────
+            while True:
                 try:
-                    page.keyboard.press("F5")
-                    page.wait_for_timeout(4_000)
-                except Exception:
-                    pass
+                    task: _Task | None = q.get(timeout=1)
+                except queue.Empty:
+                    # Keep-alive: verify the page is still responsive
+                    try:
+                        page.evaluate("() => document.readyState")
+                    except Exception:
+                        _set(status="error",
+                             error="Browser was closed. Please sign in again.")
+                        break
+                    continue
 
-            browser.close()
+                if task is None:   # shutdown signal
+                    break
+
+                try:
+                    task.complete(result=page.evaluate(task.js))
+                except Exception as exc:
+                    task.complete(error=str(exc))
+
+            try:
+                browser.close()
+            except Exception:
+                pass
 
     except Exception as exc:
-        _update(status="error", error=f"Browser error: {exc}")
-        return
+        _set(status="error", error=f"Browser error: {exc}")
 
-    # Try captured tokens in priority order
-    for key in ("graph", "office365", "office", "substrate"):
-        token = captured.get(key)
-        if not token:
-            continue
-        api_base = _verify_token(token)
-        if api_base:
-            user = _jwt_upn(token)
-            _update(status="done", token=token, api_base=api_base, user=user)
-            return
 
-    _update(
-        status="error",
-        error=(
-            "Signed in successfully, but could not capture a usable API token. "
-            "OWA may not have made any mail API calls yet. "
-            "Try clicking an email in the OWA window before it closes, then sign in again."
-        ),
-    )
-
+# ── Public control ────────────────────────────────────────────────────────────
 
 def start_login():
-    _update(status="idle", token=None, api_base=None, error=None, user=None)
-    t = threading.Thread(target=_browser_worker, daemon=True)
-    t.start()
+    global _task_queue
+    if _task_queue:
+        _task_queue.put(None)   # stop any existing browser thread
+
+    _task_queue = queue.Queue()
+    _set(status="idle", error=None, user=None)
+    threading.Thread(target=_worker, args=(_task_queue,), daemon=True).start()
 
 
 def clear():
-    _update(status="idle", token=None, api_base=None, error=None, user=None)
+    global _task_queue
+    if _task_queue:
+        _task_queue.put(None)
+    _task_queue = None
+    _set(status="idle", error=None, user=None)

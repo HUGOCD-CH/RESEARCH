@@ -1,56 +1,92 @@
 """
-Mail fetching via Microsoft API.
+Mail operations executed as fetch() calls inside the Playwright browser.
 
-Supports both Graph API (graph.microsoft.com/v1.0) and the Exchange REST API
-(outlook.office.com/api/v2.0). Both return OData JSON; the Exchange REST API
-uses PascalCase field names which we normalise to the Graph API (camelCase) format
-so that templates don't need to care which backend is active.
+All requests originate from webmail.medtronic.com itself, so session
+cookies are sent automatically and CORS is not an issue. The Exchange
+REST API (v2.0) is hosted at the same domain for Exchange Online.
+
+Responses are normalised to the Graph-API camelCase format that the
+templates already use.
 """
-import requests
+import json
+import auth
 import config
 
+# ── JavaScript helpers ────────────────────────────────────────────────────────
 
-def _get(token: str, api_base: str, path: str, params: dict | None = None) -> dict:
-    resp = requests.get(
-        api_base + path,
-        headers={"Authorization": f"Bearer {token}"},
-        params=params,
-        timeout=15,
+_FETCH_JS = """
+async (path, method, body) => {
+    const opts = {
+        method: method || 'GET',
+        credentials: 'include',
+        headers: { 'Accept': 'application/json; odata=minimalmetadata' }
+    };
+    if (body) {
+        opts.headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(body);
+    }
+    try {
+        const r = await fetch(path, opts);
+        const text = await r.text();
+        let data;
+        try { data = JSON.parse(text); } catch(e) { data = text; }
+        return { ok: r.ok, status: r.status, data: data };
+    } catch(e) {
+        return { ok: false, status: 0, error: e.toString() };
+    }
+}
+"""
+
+# Wrap the arrow-function so page.evaluate() can call it with arguments.
+# We serialise the call args into the JS string to avoid Playwright's
+# argument passing limitations with async functions.
+def _fetch(path: str, method: str = "GET", body=None) -> dict:
+    call = f"""({_FETCH_JS})({json.dumps(path)}, {json.dumps(method)}, {json.dumps(body)})"""
+    return auth.evaluate(call)
+
+
+def _require_ok(result: dict, context: str = ""):
+    if not result.get("ok"):
+        status = result.get("status", 0)
+        err = result.get("error", "")
+        raise RuntimeError(
+            f"Exchange API error{' (' + context + ')' if context else ''}: "
+            f"HTTP {status} {err}".strip()
+        )
+    return result["data"]
+
+
+# ── Candidate API paths ───────────────────────────────────────────────────────
+# Exchange Online exposes the Exchange REST API at the OWA domain.
+# Try v2.0 first; v1.0 as a fallback.
+
+def _inbox_path(top: int, skip: int) -> str:
+    qs = (
+        f"?$top={top}&$skip={skip}"
+        f"&$orderby=ReceivedDateTime%20desc"
+        f"&$select=Id,Subject,From,ReceivedDateTime,IsRead,BodyPreview"
     )
-    resp.raise_for_status()
-    return resp.json()
+    return f"/api/v2.0/me/MailFolders/inbox/messages{qs}"
 
 
-def _patch(token: str, api_base: str, path: str, body: dict):
-    resp = requests.patch(
-        api_base + path,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json=body,
-        timeout=15,
-    )
-    resp.raise_for_status()
+# ── Response normalisation ────────────────────────────────────────────────────
+# Exchange REST API uses PascalCase; normalise to Graph camelCase.
 
-
-# ── Response normalisation ───────────────────────────────────────────────────
-# Graph API uses camelCase; Exchange REST API uses PascalCase.
-# We convert everything to Graph API's camelCase format.
-
-def _addr(raw: dict) -> dict:
-    """Normalise an emailAddress dict from either API."""
-    if "emailAddress" in raw:               # already Graph format
-        return raw
-    addr = raw.get("EmailAddress", raw)
-    return {"emailAddress": {"name": addr.get("Name", ""), "address": addr.get("Address", "")}}
+def _addr(raw) -> dict:
+    if isinstance(raw, dict) and "emailAddress" in raw:
+        return raw   # already Graph format
+    if isinstance(raw, dict):
+        ea = raw.get("EmailAddress", raw)
+        return {"emailAddress": {
+            "name":    ea.get("Name", ""),
+            "address": ea.get("Address", ""),
+        }}
+    return {"emailAddress": {"name": "", "address": ""}}
 
 
 def _normalise(msg: dict) -> dict:
-    """Return a Graph-format message dict regardless of which API returned it."""
-    if "id" in msg:                         # already Graph format
-        return msg
-
+    if "id" in msg and "subject" in msg:
+        return msg   # already Graph format
     body_raw = msg.get("Body", {})
     return {
         "id":               msg.get("Id", ""),
@@ -68,48 +104,39 @@ def _normalise(msg: dict) -> dict:
     }
 
 
-# ── Public API ───────────────────────────────────────────────────────────────
+# ── Public API ────────────────────────────────────────────────────────────────
 
-def get_user_profile(token: str, api_base: str) -> dict:
+def get_user_profile() -> dict:
     try:
-        return _get(token, api_base, "/me",
-                    params={"$select": "displayName,mail,userPrincipalName"})
+        data = _require_ok(_fetch("/api/v2.0/me?$select=DisplayName,EmailAddress"), "profile")
+        if isinstance(data, dict):
+            # Normalise PascalCase → camelCase
+            return {
+                "displayName": data.get("DisplayName") or data.get("displayName", ""),
+                "mail":        data.get("EmailAddress") or data.get("mail", ""),
+            }
     except Exception:
-        return {}
+        pass
+    return {"displayName": auth.get_state().get("user", ""), "mail": ""}
 
 
-def get_messages(token: str, api_base: str, top: int = config.MESSAGES_PER_PAGE, skip: int = 0) -> dict:
-    raw = _get(
-        token, api_base,
-        "/me/mailFolders/inbox/messages",
-        params={
-            "$select": "id,subject,from,receivedDateTime,isRead,bodyPreview,"
-                       "Id,Subject,From,ReceivedDateTime,IsRead,BodyPreview",
-            "$orderby": "receivedDateTime desc,ReceivedDateTime desc",
-            "$top": top,
-            "$skip": skip,
-        },
-    )
-    raw["value"] = [_normalise(m) for m in raw.get("value", [])]
-    return raw
+def get_messages(top: int = config.MESSAGES_PER_PAGE, skip: int = 0) -> dict:
+    result = _fetch(_inbox_path(top, skip))
+    data = _require_ok(result, "list messages")
+    if isinstance(data, dict):
+        data["value"] = [_normalise(m) for m in data.get("value", [])]
+    return data
 
 
-def get_message(token: str, api_base: str, message_id: str) -> dict:
-    raw = _get(
-        token, api_base,
-        f"/me/messages/{message_id}",
-        params={
-            "$select": "id,subject,from,toRecipients,ccRecipients,"
-                       "receivedDateTime,body,isRead,"
-                       "Id,Subject,From,ToRecipients,CcRecipients,"
-                       "ReceivedDateTime,Body,IsRead",
-        },
-    )
-    return _normalise(raw)
+def get_message(message_id: str) -> dict:
+    qs = ("?$select=Id,Subject,From,ToRecipients,CcRecipients,"
+          "ReceivedDateTime,Body,IsRead")
+    result = _fetch(f"/api/v2.0/me/messages/{message_id}{qs}")
+    return _normalise(_require_ok(result, "get message"))
 
 
-def mark_as_read(token: str, api_base: str, message_id: str):
+def mark_as_read(message_id: str):
     try:
-        _patch(token, api_base, f"/me/messages/{message_id}", {"isRead": True, "IsRead": True})
+        _fetch(f"/api/v2.0/me/messages/{message_id}", "PATCH", {"IsRead": True})
     except Exception:
-        pass  # non-critical
+        pass   # non-critical
