@@ -14,20 +14,26 @@
   </thead>
   <tbody>
     {% for msg in messages %}
-    {% set sender = msg.get('from', {}).get('emailAddress', {}) %}
-    {% set is_unread = not msg.get('isRead', True) %}
+    {% set is_unread = not msg.is_read %}
     <tr class="{{ 'unread' if is_unread else '' }}">
       <td class="unread-dot">{% if is_unread %}<span class="dot"></span>{% endif %}</td>
-      <td class="sender">{{ sender.get('name') or sender.get('address', 'Unknown') }}</td>
-      <td class="subject">
-        <a href="{{ url_for('view_email', message_id=msg['id']) }}">
-          {{ msg.get('subject') or '(no subject)' }}
-        </a>
-        {% if msg.get('bodyPreview') %}
-        <span class="preview"> — {{ msg['bodyPreview'][:80] }}</span>
+      <td class="sender">
+        {% if msg.sender %}
+          {{ msg.sender.name or msg.sender.email_address }}
+        {% else %}
+          Unknown
         {% endif %}
       </td>
-      <td class="date">{{ msg.get('receivedDateTime', '')[:10] }}</td>
+      <td class="subject">
+        <a href="{{ url_for('view_email', id=msg.id, ck=msg.changekey) }}">
+          {{ msg.subject or '(no subject)' }}
+        </a>
+      </td>
+      <td class="date">
+        {% if msg.datetime_received %}
+          {{ msg.datetime_received.strftime('%Y-%m-%d') }}
+        {% endif %}
+      </td>
     </tr>
     {% endfor %}
   </tbody>

@@ -51,17 +51,45 @@ body {
 .btn:hover { background: #005fa3; }
 .btn-sm { padding: 0.35rem 0.8rem; font-size: 0.85rem; }
 
-/* ── Landing ── */
+/* ── Landing / Login ── */
 .landing {
   background: #fff;
   border-radius: 8px;
   padding: 3rem 2rem;
+  max-width: 480px;
+  margin: 0 auto;
   text-align: center;
   box-shadow: 0 1px 4px rgba(0,0,0,.08);
 }
 .landing h1 { font-size: 2rem; margin-bottom: 1rem; color: #0078d4; }
-.landing p { margin-bottom: 1rem; color: #444; line-height: 1.6; }
-.landing .btn { margin-top: 0.5rem; font-size: 1rem; padding: 0.7rem 2rem; }
+.landing p { margin-bottom: 0.75rem; color: #444; line-height: 1.6; }
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-top: 1.5rem;
+  text-align: left;
+}
+.login-form label { font-size: 0.9rem; font-weight: 600; color: #333; }
+.login-form input {
+  padding: 0.55rem 0.8rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-size: 0.95rem;
+  width: 100%;
+}
+.login-form input:focus { outline: 2px solid #0078d4; border-color: #0078d4; }
+.login-form .btn { margin-top: 0.5rem; width: 100%; font-size: 1rem; padding: 0.65rem; text-align: center; }
+.login-error {
+  background: #fff0f0;
+  border: 1px solid #f5a5a5;
+  border-radius: 4px;
+  padding: 0.6rem 0.9rem;
+  color: #c00;
+  font-size: 0.9rem;
+  margin-top: 0.75rem;
+}
 
 /* ── Inbox table ── */
 h2 { margin-bottom: 1rem; font-size: 1.3rem; color: #333; }

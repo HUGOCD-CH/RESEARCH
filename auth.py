@@ -1,62 +1,69 @@
-import json
-import os
-import msal
+import secrets
+from exchangelib import Credentials, Account, Configuration, DELEGATE
+from exchangelib.errors import UnauthorizedError
 import config
 
-
-def load_cache():
-    cache = msal.SerializableTokenCache()
-    if os.path.exists(config.TOKEN_CACHE_FILE):
-        with open(config.TOKEN_CACHE_FILE, "r") as f:
-            cache.deserialize(f.read())
-    return cache
+# In-memory session store: token -> {email, account}
+# Credentials never touch disk.
+_sessions: dict = {}
 
 
-def save_cache(cache):
-    if cache.has_state_changed:
-        with open(config.TOKEN_CACHE_FILE, "w") as f:
-            f.write(cache.serialize())
+def _connect(email: str, password: str):
+    """Try to connect to Exchange via autodiscovery, then direct config."""
+    credentials = Credentials(username=email, password=password)
+
+    # 1. Try autodiscovery (works when DNS SRV records or well-known URLs are set up)
+    try:
+        account = Account(
+            primary_smtp_address=email,
+            credentials=credentials,
+            autodiscover=True,
+            access_type=DELEGATE,
+        )
+        _ = account.inbox.total_count  # verify connection
+        return account, None
+    except UnauthorizedError:
+        return None, "Invalid email or password."
+    except Exception:
+        pass  # autodiscovery failed, try direct config
+
+    # 2. Fall back to the configured EWS server
+    try:
+        cfg = Configuration(server=config.EWS_SERVER, credentials=credentials)
+        account = Account(
+            primary_smtp_address=email,
+            config=cfg,
+            autodiscover=False,
+            access_type=DELEGATE,
+        )
+        _ = account.inbox.total_count  # verify connection
+        return account, None
+    except UnauthorizedError:
+        return None, "Invalid email or password."
+    except Exception as exc:
+        return None, f"Could not connect to mail server: {exc}"
 
 
-def get_msal_app(cache=None):
-    return msal.PublicClientApplication(
-        client_id=config.CLIENT_ID,
-        authority=config.AUTHORITY,
-        token_cache=cache,
-    )
+def login(email: str, password: str):
+    """Verify credentials and create a session. Returns (token, error)."""
+    account, error = _connect(email, password)
+    if error:
+        return None, error
+    token = secrets.token_urlsafe(32)
+    _sessions[token] = {"email": email, "account": account}
+    return token, None
 
 
-def get_token_from_cache():
-    cache = load_cache()
-    app = get_msal_app(cache)
-    accounts = app.get_accounts()
-    if not accounts:
-        return None
-    result = app.acquire_token_silent(config.SCOPES, account=accounts[0])
-    save_cache(cache)
-    if result and "access_token" in result:
-        return result["access_token"]
-    return None
+def get_account(token: str):
+    """Return the cached EWS Account for this session, or None."""
+    entry = _sessions.get(token)
+    return entry["account"] if entry else None
 
 
-def build_auth_url():
-    cache = load_cache()
-    app = get_msal_app(cache)
-    flow = app.initiate_auth_code_flow(
-        scopes=config.SCOPES,
-        redirect_uri=config.REDIRECT_URI,
-    )
-    return flow
+def get_email(token: str):
+    entry = _sessions.get(token)
+    return entry["email"] if entry else None
 
 
-def acquire_token_by_auth_code_flow(auth_code_flow, auth_response):
-    cache = load_cache()
-    app = get_msal_app(cache)
-    result = app.acquire_token_by_auth_code_flow(auth_code_flow, auth_response)
-    save_cache(cache)
-    return result
-
-
-def clear_cache():
-    if os.path.exists(config.TOKEN_CACHE_FILE):
-        os.remove(config.TOKEN_CACHE_FILE)
+def logout(token: str):
+    _sessions.pop(token, None)
