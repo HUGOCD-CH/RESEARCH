@@ -97,6 +97,22 @@ body {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ── Inbox toolbar ── */
+.inbox-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+.inbox-toolbar h2 { margin-bottom: 0; }
+
+.btn-excel {
+  background: #1d7044;
+  font-size: 0.85rem;
+  padding: 0.4rem 1rem;
+}
+.btn-excel:hover { background: #155733; }
+
 /* ── Inbox table ── */
 h2 { margin-bottom: 1rem; font-size: 1.3rem; color: #333; }
 

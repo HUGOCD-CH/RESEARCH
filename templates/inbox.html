@@ -1,6 +1,9 @@
 {% extends "base.html" %}
 {% block content %}
-<h2>Inbox</h2>
+<div class="inbox-toolbar">
+  <h2>Inbox</h2>
+  <a class="btn btn-excel" href="{{ url_for('export_today') }}">&#8595; Export Today's Emails</a>
+</div>
 
 {% if messages %}
 <table class="message-table">

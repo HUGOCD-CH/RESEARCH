@@ -1,4 +1,7 @@
-from flask import Flask, jsonify, redirect, render_template, request, url_for
+import io
+import re
+import datetime
+from flask import Flask, jsonify, redirect, render_template, request, send_file, url_for
 import auth
 import config
 import mail
@@ -94,6 +97,78 @@ def view_email(message_id):
         body_content=body.get("content", ""),
         body_is_html=body.get("contentType", "text").lower() == "html",
         user=user,
+    )
+
+
+@app.route("/export/today")
+def export_today():
+    redir = _require_auth()
+    if redir:
+        return redir
+
+    try:
+        messages = mail.get_todays_messages()
+    except Exception as exc:
+        return render_template("error.html", message=str(exc))
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Today's Emails"
+
+    headers = ["From Name", "From Email", "Subject", "Received At", "Read", "Body"]
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(fill_type="solid", fgColor="0078D4")
+
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(vertical="center")
+
+    ws.freeze_panes = "A2"
+
+    _tag_re = re.compile(r"<[^>]+>")
+
+    def strip_html(html: str) -> str:
+        text = _tag_re.sub(" ", html)
+        text = re.sub(r"&nbsp;", " ", text)
+        text = re.sub(r"&amp;", "&", text)
+        text = re.sub(r"&lt;", "<", text)
+        text = re.sub(r"&gt;", ">", text)
+        text = re.sub(r"&quot;", '"', text)
+        return re.sub(r" {2,}", " ", text).strip()
+
+    for row_num, msg in enumerate(messages, 2):
+        sender = msg.get("from", {}).get("emailAddress", {})
+        body = msg.get("body", {})
+        raw_body = body.get("content", "")
+        plain_body = strip_html(raw_body) if body.get("contentType", "text") == "html" else raw_body
+
+        ws.cell(row=row_num, column=1, value=sender.get("name", ""))
+        ws.cell(row=row_num, column=2, value=sender.get("address", ""))
+        ws.cell(row=row_num, column=3, value=msg.get("subject", ""))
+        ws.cell(row=row_num, column=4, value=msg.get("receivedDateTime", "")[:19].replace("T", " "))
+        ws.cell(row=row_num, column=5, value="Yes" if msg.get("isRead") else "No")
+        body_cell = ws.cell(row=row_num, column=6, value=plain_body[:32767])
+        body_cell.alignment = Alignment(wrap_text=True)
+
+    col_widths = [25, 35, 50, 20, 6, 80]
+    for col, width in enumerate(col_widths, 1):
+        ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = width
+
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=f"emails_{today_str}.xlsx",
     )
 
 

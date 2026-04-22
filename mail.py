@@ -140,3 +140,29 @@ def mark_as_read(message_id: str):
         _fetch(f"/api/v2.0/me/messages/{message_id}", "PATCH", {"IsRead": True})
     except Exception:
         pass   # non-critical
+
+
+def get_todays_messages() -> list[dict]:
+    """Return all inbox messages received today (local midnight → now), with body."""
+    import datetime
+    today = datetime.date.today().isoformat() + "T00:00:00Z"
+    qs = (
+        f"?$filter=ReceivedDateTime ge {today}"
+        f"&$orderby=ReceivedDateTime desc"
+        f"&$select=Id,Subject,From,ToRecipients,ReceivedDateTime,IsRead,Body"
+        f"&$top=100"
+    )
+    messages: list[dict] = []
+    path = f"/api/v2.0/me/MailFolders/inbox/messages{qs}"
+
+    # Page through results (Exchange REST returns max 100 per call)
+    while path and len(messages) < 500:
+        result = _fetch(path)
+        data = _require_ok(result, "today's messages")
+        if not isinstance(data, dict):
+            break
+        batch = [_normalise(m) for m in data.get("value", [])]
+        messages.extend(batch)
+        path = data.get("@odata.nextLink") or data.get("odata.nextLink")
+
+    return messages
