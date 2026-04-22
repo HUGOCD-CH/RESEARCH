@@ -128,7 +128,10 @@ def _browser_worker():
             except Exception:
                 browser = pw.chromium.launch(headless=False)
 
-            context = browser.new_context()
+            # ignore_https_errors bypasses corporate SSL-inspection cert errors.
+            # Medtronic's proxy re-signs traffic with its own root CA which is
+            # trusted by Windows/Chrome but not by Playwright's bundled Chromium.
+            context = browser.new_context(ignore_https_errors=True)
             context.on("request", _on_request)
             page = context.new_page()
 
