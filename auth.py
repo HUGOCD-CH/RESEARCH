@@ -38,11 +38,35 @@ def is_ready() -> bool:
 
 
 def get_token() -> str:
-    """Return the current Bearer token captured from OWA's Graph API calls."""
+    """Return the current Bearer token (from state or MSAL sessionStorage)."""
     if not is_ready():
         return ""
+    # Return token stored at login time if still present
+    stored = get_state().get("token", "")
+    if stored:
+        return stored
+    # Fall back to live MSAL sessionStorage read (handles token refresh)
     try:
-        return evaluate("() => window.__MailToken || ''") or ""
+        return evaluate("""() => {
+            const now = Math.floor(Date.now() / 1000);
+            for (const s of [sessionStorage, localStorage]) {
+                try {
+                    for (let i = 0; i < s.length; i++) {
+                        const key = s.key(i);
+                        if (!key) continue;
+                        let val;
+                        try { val = JSON.parse(s.getItem(key) || ''); }
+                        catch(e) { continue; }
+                        if (!val || val.credentialType !== 'AccessToken') continue;
+                        const t = val.secret || '';
+                        if (!t.startsWith('eyJ')) continue;
+                        const exp = parseInt(val.expiresOn || 0);
+                        if (!exp || exp > now) return t;
+                    }
+                } catch(e) {}
+            }
+            return '';
+        }""") or ""
     except Exception:
         return ""
 
@@ -125,19 +149,12 @@ def _worker(q: queue.Queue):
         with sync_playwright() as pw:
             os.makedirs(_SESSION_DIR, exist_ok=True)
 
-            # launch_persistent_context saves cookies + localStorage between runs.
-            # After the first MFA, subsequent launches restore the session
-            # automatically (no re-authentication unless the session expires).
             launch_kwargs = dict(
                 headless=False,
                 ignore_https_errors=True,
                 args=[
                     "--no-first-run",
                     "--no-default-browser-check",
-                    # Disable CORS/SOP so fetch calls from outlook.office365.com
-                    # can reach webmail.medtronic.com with cookies (Exchange REST API).
-                    "--disable-web-security",
-                    "--allow-running-insecure-content",
                 ],
             )
             try:
@@ -150,45 +167,41 @@ def _worker(q: queue.Queue):
                     _SESSION_DIR, **launch_kwargs
                 )
 
-            # Suppress protocol-handler dialog + intercept Bearer tokens that
-            # OWA uses for Graph API calls. window.__MailToken is read after
-            # login to make our own Graph API requests from the browser.
-            context.add_init_script("""
-navigator.registerProtocolHandler = () => {};
-window.__MailToken = null;
-(function(){
-    const _grab = (url, hdrs) => {
-        try {
-            const s = (typeof url === 'string') ? url : (url && url.url) || '';
-            if (!s.includes('graph.microsoft.com') &&
-                !s.includes('office365.com/api/')) return;
-            const h = hdrs instanceof Headers ? hdrs :
-                      new Headers(typeof hdrs === 'object' ? hdrs : {});
-            const a = h.get('authorization') || h.get('Authorization') || '';
-            if (a.toLowerCase().startsWith('bearer '))
-                window.__MailToken = a.slice(7);
-        } catch(e) {}
-    };
-    const _f = window.fetch;
-    window.fetch = function(input, init) {
-        _grab(input, (init && init.headers) || {});
-        return _f.apply(this, arguments);
-    };
-    const _open = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function() {
-        this._mu = arguments[1] || '';
-        return _open.apply(this, arguments);
-    };
-    const _sh = XMLHttpRequest.prototype.setRequestHeader;
-    XMLHttpRequest.prototype.setRequestHeader = function(n, v) {
-        if (n && n.toLowerCase() === 'authorization') _grab(this._mu, {Authorization: v});
-        return _sh.apply(this, arguments);
-    };
-})();
-""")
+            # Suppress the "Open email links with which app?" dialog.
+            context.add_init_script("navigator.registerProtocolHandler = () => {};")
 
             # Re-use existing page if one was saved; otherwise open a new one
             page = context.pages[0] if context.pages else context.new_page()
+
+            # Python-side response interceptor: captures the OAuth2 access_token
+            # that Azure AD returns to the browser during the MFA login flow.
+            # The token endpoint POST returns JSON with access_token, which we
+            # store and later pass as Authorization: Bearer to Graph API calls.
+            _captured: dict = {"token": ""}
+
+            def _on_response(response):
+                try:
+                    url = response.url
+                    if not any(d in url for d in ('login.microsoftonline.com',
+                                                   'login.microsoft.com',
+                                                   'login.windows.net')):
+                        return
+                    if response.status != 200:
+                        return
+                    try:
+                        import json as _json
+                        body = response.text()
+                        data = _json.loads(body)
+                        if isinstance(data, dict):
+                            t = data.get('access_token', '')
+                            if t and t.startswith('eyJ'):
+                                _captured['token'] = t
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            page.on("response", _on_response)
 
             _set(status="waiting_login")
             try:
@@ -224,12 +237,11 @@ window.__MailToken = null;
                 context.close()
                 return
 
-            # Wait for OWA to make its first Graph API calls (which populates
-            # window.__MailToken via our interceptor), then read user + token.
             user = ""
-            token = ""
+            token = _captured.get("token", "")
+
             try:
-                page.wait_for_timeout(5_000)
+                page.wait_for_timeout(3_000)
                 user = page.evaluate("""() => {
                     try {
                         return (
@@ -240,9 +252,36 @@ window.__MailToken = null;
                         );
                     } catch(e) { return ''; }
                 }""") or ""
-                token = page.evaluate("() => window.__MailToken || ''") or ""
             except Exception:
                 pass
+
+            # If the response interceptor didn't fire (e.g. session was already
+            # valid from persistent context), read the MSAL access token from
+            # sessionStorage / localStorage where MSAL.js caches credentials.
+            if not token:
+                try:
+                    token = page.evaluate("""() => {
+                        const now = Math.floor(Date.now() / 1000);
+                        for (const s of [sessionStorage, localStorage]) {
+                            try {
+                                for (let i = 0; i < s.length; i++) {
+                                    const key = s.key(i);
+                                    if (!key) continue;
+                                    let val;
+                                    try { val = JSON.parse(s.getItem(key) || ''); }
+                                    catch(e) { continue; }
+                                    if (!val || val.credentialType !== 'AccessToken') continue;
+                                    const t = val.secret || '';
+                                    if (!t.startsWith('eyJ')) continue;
+                                    const exp = parseInt(val.expiresOn || 0);
+                                    if (!exp || exp > now) return t;
+                                }
+                            } catch(e) {}
+                        }
+                        return '';
+                    }""") or ""
+                except Exception:
+                    pass
 
             _set(status="active", user=user, token=token)
 
