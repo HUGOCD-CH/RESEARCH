@@ -156,27 +156,18 @@ def _worker(q: queue.Queue):
 
             deadline = time.time() + 300
             logged_in = False
-            last_url = ""
             while time.time() < deadline:
                 try:
                     url   = page.url
                     title = page.title()
-                    if url != last_url:
-                        print(f"[auth] url={url!r}  title={title!r}", flush=True)
-                        last_url = url
-                    ok_domain = any(d in url for d in _OWA_DOMAINS)
-                    ok_path   = '/mail' in url
-                    ok_noauth = not any(p in url for p in _AUTH_PATHS)
-                    ok_title  = not _SIGNIN_RE.search(title)
-                    if ok_domain and ok_path and ok_noauth and ok_title:
-                        print(f"[auth] LOGIN DETECTED", flush=True)
+                    if (any(d in url for d in _OWA_DOMAINS) and
+                            '/mail' in url and
+                            not any(p in url for p in _AUTH_PATHS) and
+                            not _SIGNIN_RE.search(title)):
                         logged_in = True
                         break
-                    if ok_domain and url != last_url:
-                        print(f"[auth]   checks: domain={ok_domain} path={ok_path} "
-                              f"noauth={ok_noauth} title_ok={ok_title}", flush=True)
-                except Exception as exc:
-                    print(f"[auth] poll error: {exc}", flush=True)
+                except Exception:
+                    pass
                 time.sleep(1.5)
 
             if not logged_in:
@@ -184,22 +175,24 @@ def _worker(q: queue.Queue):
                 context.close()
                 return
 
-            # Let any final rendering settle
-            page.wait_for_timeout(2_000)
+            # Best-effort: read signed-in user — must NOT block reaching _set(status="active")
+            user = ""
+            try:
+                page.wait_for_timeout(3_000)  # let inbox finish rendering
+                user = page.evaluate("""() => {
+                    try {
+                        return (
+                            document.querySelector('[aria-label*="@"]')
+                                ?.getAttribute('aria-label') ||
+                            document.querySelector('[title*="@"]')
+                                ?.getAttribute('title') || ''
+                        );
+                    } catch(e) { return ''; }
+                }""") or ""
+            except Exception:
+                pass  # user info is cosmetic; always proceed to active
 
-            # Best-effort: read signed-in user from OWA's page
-            user = page.evaluate("""() => {
-                try {
-                    return (
-                        document.querySelector('[aria-label*="@"]')
-                            ?.getAttribute('aria-label') ||
-                        document.querySelector('[title*="@"]')
-                            ?.getAttribute('title') || ''
-                    );
-                } catch(e) { return ''; }
-            }""")
-
-            _set(status="active", user=user or "")
+            _set(status="active", user=user)
 
             # ── Main task loop ────────────────────────────────────────────
             consecutive_nav_errors = 0
