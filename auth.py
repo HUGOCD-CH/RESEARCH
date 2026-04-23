@@ -37,6 +37,16 @@ def is_ready() -> bool:
     return get_state()["status"] == "active"
 
 
+def get_token() -> str:
+    """Return the current Bearer token captured from OWA's Graph API calls."""
+    if not is_ready():
+        return ""
+    try:
+        return evaluate("() => window.__MailToken || ''") or ""
+    except Exception:
+        return ""
+
+
 # ── Task execution ────────────────────────────────────────────────────────────
 
 class _Task:
@@ -133,10 +143,42 @@ def _worker(q: queue.Queue):
                     _SESSION_DIR, **launch_kwargs
                 )
 
-            # Suppress "Open email links" / protocol-handler permission dialog.
-            # Outlook calls navigator.registerProtocolHandler(); this no-ops it
-            # so Chrome never shows the dialog (and Windows never opens Default Apps).
-            context.add_init_script("navigator.registerProtocolHandler = () => {};")
+            # Suppress protocol-handler dialog + intercept Bearer tokens that
+            # OWA uses for Graph API calls. window.__MailToken is read after
+            # login to make our own Graph API requests from the browser.
+            context.add_init_script("""
+navigator.registerProtocolHandler = () => {};
+window.__MailToken = null;
+(function(){
+    const _grab = (url, hdrs) => {
+        try {
+            const s = (typeof url === 'string') ? url : (url && url.url) || '';
+            if (!s.includes('graph.microsoft.com') &&
+                !s.includes('office365.com/api/')) return;
+            const h = hdrs instanceof Headers ? hdrs :
+                      new Headers(typeof hdrs === 'object' ? hdrs : {});
+            const a = h.get('authorization') || h.get('Authorization') || '';
+            if (a.toLowerCase().startsWith('bearer '))
+                window.__MailToken = a.slice(7);
+        } catch(e) {}
+    };
+    const _f = window.fetch;
+    window.fetch = function(input, init) {
+        _grab(input, (init && init.headers) || {});
+        return _f.apply(this, arguments);
+    };
+    const _open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function() {
+        this._mu = arguments[1] || '';
+        return _open.apply(this, arguments);
+    };
+    const _sh = XMLHttpRequest.prototype.setRequestHeader;
+    XMLHttpRequest.prototype.setRequestHeader = function(n, v) {
+        if (n && n.toLowerCase() === 'authorization') _grab(this._mu, {Authorization: v});
+        return _sh.apply(this, arguments);
+    };
+})();
+""")
 
             # Re-use existing page if one was saved; otherwise open a new one
             page = context.pages[0] if context.pages else context.new_page()
@@ -175,10 +217,12 @@ def _worker(q: queue.Queue):
                 context.close()
                 return
 
-            # Best-effort: read signed-in user — must NOT block reaching _set(status="active")
+            # Wait for OWA to make its first Graph API calls (which populates
+            # window.__MailToken via our interceptor), then read user + token.
             user = ""
+            token = ""
             try:
-                page.wait_for_timeout(3_000)
+                page.wait_for_timeout(5_000)
                 user = page.evaluate("""() => {
                     try {
                         return (
@@ -189,10 +233,11 @@ def _worker(q: queue.Queue):
                         );
                     } catch(e) { return ''; }
                 }""") or ""
+                token = page.evaluate("() => window.__MailToken || ''") or ""
             except Exception:
                 pass
 
-            _set(status="active", user=user)
+            _set(status="active", user=user, token=token)
 
             # ── Main task loop ────────────────────────────────────────────
             consecutive_nav_errors = 0
