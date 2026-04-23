@@ -24,7 +24,7 @@
     .then(function(r) { return r.json(); })
     .then(function(data) {
       var msg = document.getElementById("status-msg");
-      if (data.status === "done") {
+      if (data.status === "active") {
         msg.textContent = "Signed in" + (data.user ? " as " + data.user : "") + "! Loading inbox…";
         window.location.href = "{{ url_for('inbox') }}";
       } else if (data.status === "error") {
