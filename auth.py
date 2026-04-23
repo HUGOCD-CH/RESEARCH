@@ -160,15 +160,19 @@ def _worker(q: queue.Queue):
                 try:
                     url   = page.url
                     title = page.title()
+                    print(f"[auth] poll: {url[:80]!r}", flush=True)
                     if (any(d in url for d in _OWA_DOMAINS) and
                             '/mail' in url and
                             not any(p in url for p in _AUTH_PATHS) and
                             not _SIGNIN_RE.search(title)):
+                        print("[auth] LOGIN DETECTED", flush=True)
                         logged_in = True
                         break
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(f"[auth] poll error: {exc}", flush=True)
                 time.sleep(1.5)
+
+            print(f"[auth] poll done: logged_in={logged_in}", flush=True)
 
             if not logged_in:
                 _set(status="error", error="Login timed out. Please try again.")
@@ -176,6 +180,7 @@ def _worker(q: queue.Queue):
                 return
 
             # Best-effort: read signed-in user — must NOT block reaching _set(status="active")
+            print("[auth] fetching user info...", flush=True)
             user = ""
             try:
                 page.wait_for_timeout(3_000)  # let inbox finish rendering
@@ -189,10 +194,13 @@ def _worker(q: queue.Queue):
                         );
                     } catch(e) { return ''; }
                 }""") or ""
-            except Exception:
-                pass  # user info is cosmetic; always proceed to active
+                print(f"[auth] user info: {user!r}", flush=True)
+            except Exception as exc:
+                print(f"[auth] user info error (ignored): {exc}", flush=True)
 
+            print("[auth] setting status=active", flush=True)
             _set(status="active", user=user)
+            print("[auth] status=active SET", flush=True)
 
             # ── Main task loop ────────────────────────────────────────────
             consecutive_nav_errors = 0
