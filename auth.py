@@ -37,38 +37,46 @@ def is_ready() -> bool:
     return get_state()["status"] == "active"
 
 
+_MSAL_TOKEN_JS = """() => {
+    const now = Math.floor(Date.now() / 1000);
+    let fallback = '';
+    for (const s of [sessionStorage, localStorage]) {
+        try {
+            for (let i = 0; i < s.length; i++) {
+                const key = s.key(i);
+                if (!key) continue;
+                let val;
+                try { val = JSON.parse(s.getItem(key) || ''); }
+                catch(e) { continue; }
+                if (!val || val.credentialType !== 'AccessToken') continue;
+                const t = val.secret || '';
+                if (!t.startsWith('eyJ') || t.length < 100) continue;
+                const exp = parseInt(val.expiresOn || 0);
+                if (exp && exp <= now) continue;
+                // Prefer Graph-scoped tokens (usable against graph.microsoft.com)
+                const target = (val.target || '').toLowerCase();
+                if (target.includes('graph.microsoft.com')) return t;
+                fallback = fallback || t;
+            }
+        } catch(e) {}
+    }
+    return fallback;
+}"""
+
+
 def get_token() -> str:
-    """Return the current Bearer token (from state or MSAL sessionStorage)."""
+    """Return a valid MSAL Bearer token, preferring Graph-scoped ones."""
     if not is_ready():
         return ""
-    # Return token stored at login time if still present
-    stored = get_state().get("token", "")
-    if stored:
-        return stored
-    # Fall back to live MSAL sessionStorage read (handles token refresh)
+    # Always read live from sessionStorage so MSAL token refreshes are picked up.
     try:
-        return evaluate("""() => {
-            const now = Math.floor(Date.now() / 1000);
-            for (const s of [sessionStorage, localStorage]) {
-                try {
-                    for (let i = 0; i < s.length; i++) {
-                        const key = s.key(i);
-                        if (!key) continue;
-                        let val;
-                        try { val = JSON.parse(s.getItem(key) || ''); }
-                        catch(e) { continue; }
-                        if (!val || val.credentialType !== 'AccessToken') continue;
-                        const t = val.secret || '';
-                        if (!t.startsWith('eyJ')) continue;
-                        const exp = parseInt(val.expiresOn || 0);
-                        if (!exp || exp > now) return t;
-                    }
-                } catch(e) {}
-            }
-            return '';
-        }""") or ""
+        t = evaluate(_MSAL_TOKEN_JS) or ""
+        if t:
+            return t
     except Exception:
-        return ""
+        pass
+    # Last resort: token captured at login time (may be expired)
+    return get_state().get("token", "")
 
 
 # ── Task execution ────────────────────────────────────────────────────────────
@@ -173,10 +181,9 @@ def _worker(q: queue.Queue):
             # Re-use existing page if one was saved; otherwise open a new one
             page = context.pages[0] if context.pages else context.new_page()
 
-            # Python-side response interceptor: captures the OAuth2 access_token
-            # that Azure AD returns to the browser during the MFA login flow.
-            # The token endpoint POST returns JSON with access_token, which we
-            # store and later pass as Authorization: Bearer to Graph API calls.
+            # Context-level response interceptor: captures OAuth2 access_token
+            # from Azure AD token endpoint responses (fires for all frames/pages,
+            # including MSAL.js hidden iframes used for silent token renewal).
             _captured: dict = {"token": ""}
 
             def _on_response(response):
@@ -201,7 +208,7 @@ def _worker(q: queue.Queue):
                 except Exception:
                     pass
 
-            page.on("response", _on_response)
+            context.on("response", _on_response)
 
             _set(status="waiting_login")
             try:
@@ -238,10 +245,10 @@ def _worker(q: queue.Queue):
                 return
 
             user = ""
-            token = _captured.get("token", "")
+            token = ""
 
+            # Read the display name while the inbox is freshly loaded.
             try:
-                page.wait_for_timeout(3_000)
                 user = page.evaluate("""() => {
                     try {
                         return (
@@ -255,33 +262,24 @@ def _worker(q: queue.Queue):
             except Exception:
                 pass
 
-            # If the response interceptor didn't fire (e.g. session was already
-            # valid from persistent context), read the MSAL access token from
-            # sessionStorage / localStorage where MSAL.js caches credentials.
-            if not token:
+            # Wait up to 30 s for MSAL.js to populate sessionStorage with a
+            # Graph-scoped access token.  On a cached session (no fresh MFA) the
+            # token arrives via a silent hidden-iframe exchange a few seconds
+            # after the inbox loads — the 3-second fixed wait was too short.
+            token_deadline = time.time() + 30
+            while time.time() < token_deadline:
+                # Check response interceptor first (fastest path)
+                token = _captured.get("token", "")
+                if token:
+                    break
+                # Poll MSAL sessionStorage / localStorage
                 try:
-                    token = page.evaluate("""() => {
-                        const now = Math.floor(Date.now() / 1000);
-                        for (const s of [sessionStorage, localStorage]) {
-                            try {
-                                for (let i = 0; i < s.length; i++) {
-                                    const key = s.key(i);
-                                    if (!key) continue;
-                                    let val;
-                                    try { val = JSON.parse(s.getItem(key) || ''); }
-                                    catch(e) { continue; }
-                                    if (!val || val.credentialType !== 'AccessToken') continue;
-                                    const t = val.secret || '';
-                                    if (!t.startsWith('eyJ')) continue;
-                                    const exp = parseInt(val.expiresOn || 0);
-                                    if (!exp || exp > now) return t;
-                                }
-                            } catch(e) {}
-                        }
-                        return '';
-                    }""") or ""
+                    token = page.evaluate(_MSAL_TOKEN_JS) or ""
+                    if token:
+                        break
                 except Exception:
                     pass
+                time.sleep(1)
 
             _set(status="active", user=user, token=token)
 
