@@ -131,7 +131,14 @@ def _worker(q: queue.Queue):
             launch_kwargs = dict(
                 headless=False,
                 ignore_https_errors=True,
-                args=["--no-first-run", "--no-default-browser-check"],
+                args=[
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    # Disable CORS/SOP so fetch calls from outlook.office365.com
+                    # can reach webmail.medtronic.com with cookies (Exchange REST API).
+                    "--disable-web-security",
+                    "--allow-running-insecure-content",
+                ],
             )
             try:
                 context = pw.chromium.launch_persistent_context(

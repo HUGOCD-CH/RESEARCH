@@ -1,35 +1,37 @@
 """
-Mail operations via Microsoft Graph API, executed as fetch() calls inside
-the Playwright browser. The Bearer token is intercepted from OWA's own
-Graph API requests (window.__MailToken) and reused for our calls.
+Mail operations executed as fetch() calls inside the Playwright browser.
 
-Graph API endpoint: https://graph.microsoft.com/v1.0/me/...
-CORS is supported by Graph API, so cross-origin requests from
-outlook.office365.com work fine with Authorization headers.
+The browser runs with --disable-web-security so fetch() calls from the
+outlook.office365.com page can reach webmail.medtronic.com (Medtronic's
+own Exchange server) with session cookies — bypassing CORS restrictions.
+Exchange REST API v2 is still available at webmail.medtronic.com even
+though Microsoft retired it from outlook.office365.com.
+
+Responses are normalised to the Graph-API camelCase format the templates use.
 """
 import json
 import auth
 import config
 
-# ── Graph API fetch helper ────────────────────────────────────────────────────
+# ── JavaScript fetch helper ───────────────────────────────────────────────────
+# Uses absolute URL to webmail.medtronic.com so the retired endpoint at
+# outlook.office365.com is never hit.  credentials:'include' sends the
+# Exchange session cookies that were set during the SSO redirect chain.
 
-_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-
-_GRAPH_FETCH_JS = """
-async (path, method, body, token) => {
+_FETCH_JS = """
+async (path, method, body) => {
+    const base = """ + json.dumps(config.OWA_URL) + """;
     const opts = {
         method: method || 'GET',
-        headers: {
-            'Accept':        'application/json',
-            'Authorization': 'Bearer ' + token,
-        }
+        credentials: 'include',
+        headers: { 'Accept': 'application/json; odata=minimalmetadata' }
     };
     if (body) {
         opts.headers['Content-Type'] = 'application/json';
         opts.body = JSON.stringify(body);
     }
     try {
-        const r = await fetch('https://graph.microsoft.com/v1.0' + path, opts);
+        const r = await fetch(base + path, opts);
         const text = await r.text();
         let data;
         try { data = JSON.parse(text); } catch(e) { data = text; }
@@ -41,14 +43,7 @@ async (path, method, body, token) => {
 """
 
 def _fetch(path: str, method: str = "GET", body=None) -> dict:
-    token = auth.get_token()
-    if not token:
-        raise RuntimeError(
-            "No Bearer token available. The browser session may not be fully loaded. "
-            "Please sign out and sign in again."
-        )
-    call = (f"({_GRAPH_FETCH_JS})"
-            f"({json.dumps(path)}, {json.dumps(method)}, {json.dumps(body)}, {json.dumps(token)})")
+    call = f"""({_FETCH_JS})({json.dumps(path)}, {json.dumps(method)}, {json.dumps(body)})"""
     return auth.evaluate(call)
 
 
@@ -57,23 +52,67 @@ def _require_ok(result: dict, context: str = ""):
         status = result.get("status", 0)
         err = result.get("error", "")
         raise RuntimeError(
-            f"Graph API error{' (' + context + ')' if context else ''}: "
+            f"Exchange API error{' (' + context + ')' if context else ''}: "
             f"HTTP {status} {err}".strip()
         )
     return result["data"]
 
 
+# ── Candidate API paths ───────────────────────────────────────────────────────
+
+def _inbox_path(top: int, skip: int) -> str:
+    qs = (
+        f"?$top={top}&$skip={skip}"
+        f"&$orderby=ReceivedDateTime%20desc"
+        f"&$select=Id,Subject,From,ReceivedDateTime,IsRead,BodyPreview"
+    )
+    return f"/api/v2.0/me/MailFolders/inbox/messages{qs}"
+
+
+# ── Response normalisation ────────────────────────────────────────────────────
+# Exchange REST API uses PascalCase; normalise to Graph camelCase.
+
+def _addr(raw) -> dict:
+    if isinstance(raw, dict) and "emailAddress" in raw:
+        return raw   # already Graph format
+    if isinstance(raw, dict):
+        ea = raw.get("EmailAddress", raw)
+        return {"emailAddress": {
+            "name":    ea.get("Name", ""),
+            "address": ea.get("Address", ""),
+        }}
+    return {"emailAddress": {"name": "", "address": ""}}
+
+
+def _normalise(msg: dict) -> dict:
+    if "id" in msg and "subject" in msg:
+        return msg   # already Graph format
+    body_raw = msg.get("Body", {})
+    return {
+        "id":               msg.get("Id", ""),
+        "subject":          msg.get("Subject", ""),
+        "from":             _addr(msg.get("From", {})),
+        "receivedDateTime": msg.get("ReceivedDateTime", ""),
+        "isRead":           msg.get("IsRead", True),
+        "bodyPreview":      msg.get("BodyPreview", ""),
+        "body": {
+            "contentType": body_raw.get("ContentType", "Text").lower(),
+            "content":     body_raw.get("Content", ""),
+        },
+        "toRecipients": [_addr(r) for r in msg.get("ToRecipients", [])],
+        "ccRecipients": [_addr(r) for r in msg.get("CcRecipients", [])],
+    }
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
-# Graph API already returns camelCase keys matching our templates, so no
-# normalisation needed.  toRecipients/ccRecipients use the same shape too.
 
 def get_user_profile() -> dict:
     try:
-        data = _require_ok(_fetch("/me?$select=displayName,mail"), "profile")
+        data = _require_ok(_fetch("/api/v2.0/me?$select=DisplayName,EmailAddress"), "profile")
         if isinstance(data, dict):
             return {
-                "displayName": data.get("displayName", ""),
-                "mail":        data.get("mail", ""),
+                "displayName": data.get("DisplayName") or data.get("displayName", ""),
+                "mail":        data.get("EmailAddress") or data.get("mail", ""),
             }
     except Exception:
         pass
@@ -81,24 +120,23 @@ def get_user_profile() -> dict:
 
 
 def get_messages(top: int = config.MESSAGES_PER_PAGE, skip: int = 0) -> dict:
-    qs = (
-        f"?$top={top}&$skip={skip}"
-        f"&$orderby=receivedDateTime desc"
-        f"&$select=id,subject,from,receivedDateTime,isRead,bodyPreview"
-    )
-    result = _fetch(f"/me/mailFolders/inbox/messages{qs}")
-    return _require_ok(result, "list messages")
+    result = _fetch(_inbox_path(top, skip))
+    data = _require_ok(result, "list messages")
+    if isinstance(data, dict):
+        data["value"] = [_normalise(m) for m in data.get("value", [])]
+    return data
 
 
 def get_message(message_id: str) -> dict:
-    qs = "?$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,isRead"
-    result = _fetch(f"/me/messages/{message_id}{qs}")
-    return _require_ok(result, "get message")
+    qs = ("?$select=Id,Subject,From,ToRecipients,CcRecipients,"
+          "ReceivedDateTime,Body,IsRead")
+    result = _fetch(f"/api/v2.0/me/messages/{message_id}{qs}")
+    return _normalise(_require_ok(result, "get message"))
 
 
 def mark_as_read(message_id: str):
     try:
-        _fetch(f"/me/messages/{message_id}", "PATCH", {"isRead": True})
+        _fetch(f"/api/v2.0/me/messages/{message_id}", "PATCH", {"IsRead": True})
     except Exception:
         pass   # non-critical
 
@@ -108,23 +146,21 @@ def get_todays_messages() -> list[dict]:
     import datetime
     today = datetime.date.today().isoformat() + "T00:00:00Z"
     qs = (
-        f"?$filter=receivedDateTime ge {today}"
-        f"&$orderby=receivedDateTime desc"
-        f"&$select=id,subject,from,toRecipients,receivedDateTime,isRead,body"
+        f"?$filter=ReceivedDateTime ge {today}"
+        f"&$orderby=ReceivedDateTime desc"
+        f"&$select=Id,Subject,From,ToRecipients,ReceivedDateTime,IsRead,Body"
         f"&$top=100"
     )
     messages: list[dict] = []
-    path = f"/me/mailFolders/inbox/messages{qs}"
+    path = f"/api/v2.0/me/MailFolders/inbox/messages{qs}"
 
     while path and len(messages) < 500:
         result = _fetch(path)
         data = _require_ok(result, "today's messages")
         if not isinstance(data, dict):
             break
-        messages.extend(data.get("value", []))
+        batch = [_normalise(m) for m in data.get("value", [])]
+        messages.extend(batch)
         path = data.get("@odata.nextLink") or data.get("odata.nextLink")
-        # nextLink from Graph API is absolute — strip the base for _fetch
-        if path and path.startswith("https://graph.microsoft.com/v1.0"):
-            path = path[len("https://graph.microsoft.com/v1.0"):]
 
     return messages
