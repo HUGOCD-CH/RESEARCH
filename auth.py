@@ -39,44 +39,65 @@ def is_ready() -> bool:
 
 _MSAL_TOKEN_JS = """() => {
     const now = Math.floor(Date.now() / 1000);
-    let fallback = '';
+    const decodeAud = (t) => {
+        try {
+            const p = JSON.parse(atob(t.split('.')[1].replace(/-/g,'+').replace(/_/g,'/')));
+            const a = p.aud;
+            return (Array.isArray(a) ? a.join(' ') : (a || '')).toLowerCase();
+        } catch(e) { return ''; }
+    };
+    // Microsoft Graph identified by URL or its well-known app-ID GUID
+    const GRAPH = ['graph.microsoft.com', '00000003-0000-0000-c000-000000000000'];
+    const OWA   = ['outlook.office365.com', 'outlook.office.com'];
+    let graphToken = '', owaToken = '';
     for (const s of [sessionStorage, localStorage]) {
         try {
             for (let i = 0; i < s.length; i++) {
                 const key = s.key(i);
                 if (!key) continue;
                 let val;
-                try { val = JSON.parse(s.getItem(key) || ''); }
-                catch(e) { continue; }
+                try { val = JSON.parse(s.getItem(key) || ''); } catch(e) { continue; }
                 if (!val || val.credentialType !== 'AccessToken') continue;
                 const t = val.secret || '';
                 if (!t.startsWith('eyJ') || t.length < 100) continue;
                 const exp = parseInt(val.expiresOn || 0);
                 if (exp && exp <= now) continue;
-                // Prefer Graph-scoped tokens (usable against graph.microsoft.com)
-                const target = (val.target || '').toLowerCase();
-                if (target.includes('graph.microsoft.com')) return t;
-                fallback = fallback || t;
+                const aud = decodeAud(t);
+                if (!graphToken && GRAPH.some(g => aud.includes(g))) { graphToken = t; }
+                if (!owaToken  && OWA.some(o => aud.includes(o)))   { owaToken  = t; }
             }
         } catch(e) {}
     }
-    return fallback;
+    return { graphToken: graphToken, owaToken: owaToken };
 }"""
 
 
-def get_token() -> str:
-    """Return a valid MSAL Bearer token, preferring Graph-scoped ones."""
-    if not is_ready():
-        return ""
-    # Always read live from sessionStorage so MSAL token refreshes are picked up.
+def _read_tokens() -> dict:
+    """Read { graphToken, owaToken } from MSAL sessionStorage."""
     try:
-        t = evaluate(_MSAL_TOKEN_JS) or ""
-        if t:
-            return t
+        result = evaluate(_MSAL_TOKEN_JS)
+        if isinstance(result, dict):
+            return result
     except Exception:
         pass
-    # Last resort: token captured at login time (may be expired)
+    return {"graphToken": "", "owaToken": ""}
+
+
+def get_token() -> str:
+    """Return a Graph-scoped Bearer token if one is cached by MSAL.js."""
+    if not is_ready():
+        return ""
+    t = _read_tokens().get("graphToken", "")
+    if t:
+        return t
     return get_state().get("token", "")
+
+
+def get_owa_token() -> str:
+    """Return an OWA-scoped Bearer token (audience=outlook.office365.com)."""
+    if not is_ready():
+        return ""
+    return _read_tokens().get("owaToken", "")
 
 
 # ── Task execution ────────────────────────────────────────────────────────────
@@ -262,26 +283,29 @@ def _worker(q: queue.Queue):
             except Exception:
                 pass
 
-            # Wait up to 30 s for MSAL.js to populate sessionStorage with a
-            # Graph-scoped access token.  On a cached session (no fresh MFA) the
-            # token arrives via a silent hidden-iframe exchange a few seconds
-            # after the inbox loads — the 3-second fixed wait was too short.
+            # Wait up to 30 s for MSAL.js to populate sessionStorage.
+            # On a cached session (no fresh MFA) tokens arrive a few seconds
+            # after the inbox loads via MSAL's silent hidden-iframe exchange.
+            # We accept either a Graph token or an OWA token so we can fall
+            # back to same-origin OWA REST calls if Graph is unavailable.
             token_deadline = time.time() + 30
+            graph_token = _captured.get("token", "")  # from response interceptor
+            owa_token = ""
             while time.time() < token_deadline:
-                # Check response interceptor first (fastest path)
-                token = _captured.get("token", "")
-                if token:
+                if not graph_token or not owa_token:
+                    try:
+                        tokens = page.evaluate(_MSAL_TOKEN_JS)
+                        if isinstance(tokens, dict):
+                            graph_token = graph_token or tokens.get("graphToken", "")
+                            owa_token   = owa_token   or tokens.get("owaToken", "")
+                    except Exception:
+                        pass
+                if graph_token or owa_token:
                     break
-                # Poll MSAL sessionStorage / localStorage
-                try:
-                    token = page.evaluate(_MSAL_TOKEN_JS) or ""
-                    if token:
-                        break
-                except Exception:
-                    pass
                 time.sleep(1)
 
-            _set(status="active", user=user, token=token)
+            token = graph_token  # stored token is the Graph one (best for API calls)
+            _set(status="active", user=user, token=token, owa_token=owa_token)
 
             # ── Main task loop ────────────────────────────────────────────
             consecutive_nav_errors = 0
