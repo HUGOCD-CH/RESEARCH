@@ -214,6 +214,13 @@ def _worker(q: queue.Queue):
 navigator.registerProtocolHandler = () => {};
 window.__MailToken = '';
 (function() {
+    const _hasMail = (token) => {
+        try {
+            const p = JSON.parse(atob(token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/')));
+            const scp = (p.scp || p.scope || '').toLowerCase();
+            return scp.includes('mail') || scp.includes('message');
+        } catch(e) { return false; }
+    };
     const _grab = (url, hdrs) => {
         try {
             const s = typeof url === 'string' ? url : (url && url.url) || '';
@@ -221,8 +228,12 @@ window.__MailToken = '';
             const h = hdrs instanceof Headers ? hdrs :
                       new Headers(typeof hdrs === 'object' ? hdrs : {});
             const a = h.get('authorization') || h.get('Authorization') || '';
-            if (a.toLowerCase().startsWith('bearer ') && !window.__MailToken)
-                window.__MailToken = a.slice(7);
+            if (!a.toLowerCase().startsWith('bearer ')) return;
+            const token = a.slice(7);
+            // Always prefer a token that has mail scope.
+            // Keep updating until we see one that matches.
+            if (_hasMail(token) || !window.__MailToken)
+                window.__MailToken = token;
         } catch(e) {}
     };
     const _f = window.fetch;
@@ -340,11 +351,13 @@ window.__MailToken = '';
             owa_token = ""
             while time.time() < token_deadline:
                 try:
-                    # Path 1: fetch-intercepted Graph Bearer token
-                    if not graph_token:
-                        t = page.evaluate("() => window.__MailToken || ''") or ""
-                        if t and t.startswith("eyJ"):
-                            graph_token = t
+                    # Path 1: fetch-intercepted Graph Bearer token.
+                    # Keep reading even if we already have one — the interceptor
+                    # upgrades window.__MailToken whenever it sees a mail-scoped
+                    # token, so later reads may be better than earlier ones.
+                    t = page.evaluate("() => window.__MailToken || ''") or ""
+                    if t and t.startswith("eyJ"):
+                        graph_token = t
 
                     # Path 3: MSAL sessionStorage (backup)
                     if not graph_token or not owa_token:
