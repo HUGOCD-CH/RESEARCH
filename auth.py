@@ -84,12 +84,21 @@ def _read_tokens() -> dict:
 
 
 def get_token() -> str:
-    """Return a Graph-scoped Bearer token if one is cached by MSAL.js."""
+    """Return a Graph-scoped Bearer token captured from new Outlook's API calls."""
     if not is_ready():
         return ""
+    # Path 1: live read of the fetch-intercepted token (refreshes automatically)
+    try:
+        t = evaluate("() => window.__MailToken || ''") or ""
+        if t and t.startswith("eyJ"):
+            return t
+    except Exception:
+        pass
+    # Path 2: MSAL sessionStorage
     t = _read_tokens().get("graphToken", "")
     if t:
         return t
+    # Path 3: token stored at login time
     return get_state().get("token", "")
 
 
@@ -196,8 +205,44 @@ def _worker(q: queue.Queue):
                     _SESSION_DIR, **launch_kwargs
                 )
 
-            # Suppress the "Open email links with which app?" dialog.
-            context.add_init_script("navigator.registerProtocolHandler = () => {};")
+            # Suppress protocol-handler dialog and intercept Bearer tokens.
+            # New Outlook (outlook.office365.com) calls graph.microsoft.com with
+            # Authorization: Bearer <token> in the main page frame.  By patching
+            # window.fetch and XMLHttpRequest before any page JS runs we capture
+            # the token into window.__MailToken the moment OWA loads its inbox.
+            context.add_init_script("""
+navigator.registerProtocolHandler = () => {};
+window.__MailToken = '';
+(function() {
+    const _grab = (url, hdrs) => {
+        try {
+            const s = typeof url === 'string' ? url : (url && url.url) || '';
+            if (!s.includes('graph.microsoft.com')) return;
+            const h = hdrs instanceof Headers ? hdrs :
+                      new Headers(typeof hdrs === 'object' ? hdrs : {});
+            const a = h.get('authorization') || h.get('Authorization') || '';
+            if (a.toLowerCase().startsWith('bearer ') && !window.__MailToken)
+                window.__MailToken = a.slice(7);
+        } catch(e) {}
+    };
+    const _f = window.fetch;
+    window.fetch = function(input, init) {
+        _grab(input, (init && init.headers) || {});
+        return _f.apply(this, arguments);
+    };
+    const _open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function() {
+        this.__url = arguments[1] || '';
+        return _open.apply(this, arguments);
+    };
+    const _sh = XMLHttpRequest.prototype.setRequestHeader;
+    XMLHttpRequest.prototype.setRequestHeader = function(n, v) {
+        if (n && n.toLowerCase() === 'authorization')
+            _grab(this.__url, {Authorization: v});
+        return _sh.apply(this, arguments);
+    };
+})();
+""")
 
             # Re-use existing page if one was saved; otherwise open a new one
             page = context.pages[0] if context.pages else context.new_page()
@@ -283,28 +328,37 @@ def _worker(q: queue.Queue):
             except Exception:
                 pass
 
-            # Wait up to 30 s for MSAL.js to populate sessionStorage.
-            # On a cached session (no fresh MFA) tokens arrive a few seconds
-            # after the inbox loads via MSAL's silent hidden-iframe exchange.
-            # We accept either a Graph token or an OWA token so we can fall
-            # back to same-origin OWA REST calls if Graph is unavailable.
+            # Wait up to 30 s for a token to become available.
+            # Three capture paths (first to succeed wins):
+            #   1. window.__MailToken — set by our fetch interceptor when new
+            #      Outlook calls graph.microsoft.com from the main page frame.
+            #   2. Python response interceptor — set when Azure AD token endpoint
+            #      fires during a fresh MFA login.
+            #   3. MSAL sessionStorage — if the app caches tokens there.
             token_deadline = time.time() + 30
-            graph_token = _captured.get("token", "")  # from response interceptor
+            graph_token = _captured.get("token", "")
             owa_token = ""
             while time.time() < token_deadline:
-                if not graph_token or not owa_token:
-                    try:
+                try:
+                    # Path 1: fetch-intercepted Graph Bearer token
+                    if not graph_token:
+                        t = page.evaluate("() => window.__MailToken || ''") or ""
+                        if t and t.startswith("eyJ"):
+                            graph_token = t
+
+                    # Path 3: MSAL sessionStorage (backup)
+                    if not graph_token or not owa_token:
                         tokens = page.evaluate(_MSAL_TOKEN_JS)
                         if isinstance(tokens, dict):
                             graph_token = graph_token or tokens.get("graphToken", "")
                             owa_token   = owa_token   or tokens.get("owaToken", "")
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
                 if graph_token or owa_token:
                     break
                 time.sleep(1)
 
-            token = graph_token  # stored token is the Graph one (best for API calls)
+            token = graph_token
             _set(status="active", user=user, token=token, owa_token=owa_token)
 
             # ── Main task loop ────────────────────────────────────────────
