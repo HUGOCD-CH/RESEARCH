@@ -30,13 +30,13 @@ def index():
 @app.route("/auth/start")
 def auth_start():
     auth.start_login()
-    return render_template("waiting.html")
+    return render_template("waiting.html", mode="launch")
 
 
 @app.route("/auth/connect")
 def auth_connect():
     auth.connect_browser()
-    return render_template("waiting.html")
+    return render_template("waiting.html", mode="connect")
 
 
 @app.route("/auth/poll")

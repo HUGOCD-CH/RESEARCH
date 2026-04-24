@@ -1,8 +1,28 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="landing">
-  <h1>Sign in to Webmail</h1>
 
+{% if mode == "connect" %}
+  <h1>Connecting to Chrome&hellip;</h1>
+  <div class="device-code-box">
+    <p style="font-size:1rem;color:#333;margin-bottom:0.5rem;">
+      The app is attaching to your running Chrome via port 9222.
+    </p>
+    <p style="font-size:0.9rem;color:#555;margin-top:0.5rem;">
+      If you see an error below, follow these steps:
+    </p>
+    <ol style="text-align:left;margin:0.75rem 1.5rem;color:#444;line-height:1.8;font-size:0.9rem;">
+      <li><strong>Close Chrome completely</strong> (all windows).</li>
+      <li>Double-click <strong>start_chrome.bat</strong> — or run:<br>
+          <code style="background:#f0f0f0;padding:0.1em 0.4em;border-radius:3px;font-size:0.85em;">
+            chrome.exe --remote-debugging-port=9222
+          </code></li>
+      <li>Log in to webmail in that window (MFA only once — your session is saved).</li>
+      <li>Click <strong>Try again</strong> below.</li>
+    </ol>
+  </div>
+{% else %}
+  <h1>Sign in to Webmail</h1>
   <div class="device-code-box">
     <p style="font-size:1rem;color:#333;margin-bottom:0.5rem;">
       A browser window has opened to <strong>webmail.medtronic.com</strong>.
@@ -13,26 +33,30 @@
       <li>This page will redirect automatically.</li>
     </ol>
   </div>
+{% endif %}
 
-  <p id="status-msg" class="status-msg">Waiting for sign-in&hellip;</p>
+  <p id="status-msg" class="status-msg">
+    {% if mode == "connect" %}Connecting&hellip;{% else %}Waiting for sign-in&hellip;{% endif %}
+  </p>
   <div class="spinner"></div>
 </div>
 
 <script>
+var _retryUrl = "{{ url_for('auth_connect') if mode == 'connect' else url_for('auth_start') }}";
 (function poll() {
   fetch("{{ url_for('auth_poll') }}")
     .then(function(r) { return r.json(); })
     .then(function(data) {
       var msg = document.getElementById("status-msg");
       if (data.status === "active") {
-        msg.textContent = "Signed in" + (data.user ? " as " + data.user : "") + "! Loading inbox…";
+        msg.textContent = "Connected" + (data.user ? " — " + data.user : "") + "! Loading inbox…";
         window.location.href = "{{ url_for('inbox') }}";
       } else if (data.status === "error") {
         msg.textContent = data.error || "An error occurred.";
         document.querySelector(".spinner").style.display = "none";
         var btn = document.createElement("a");
         btn.className = "btn";
-        btn.href = "{{ url_for('auth_start') }}";
+        btn.href = _retryUrl;
         btn.textContent = "Try again";
         btn.style.marginTop = "1rem";
         msg.after(btn);
