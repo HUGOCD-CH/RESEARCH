@@ -275,6 +275,18 @@ def _setup_page(page, _captured: dict, token_deadline: float):
             break
         if graph_token and _token_has_mail_scope(graph_token):
             break
+        # Also break if OWA has already loaded inbox data into the page cache —
+        # in that case the fallback path in mail.py can serve the response even
+        # without a token we can use directly.
+        try:
+            inbox_ready = page.evaluate(
+                "() => !!(window.__InboxData && window.__InboxData.value && "
+                "window.__InboxData.value.length > 0)"
+            )
+            if inbox_ready:
+                break
+        except Exception:
+            pass
         time.sleep(1)
 
     return user, graph_token, owa_token
@@ -345,9 +357,34 @@ def _connect_worker(q: queue.Queue):
 
             _set(status="waiting_login")
 
-            # Inject interceptors and wait for tokens (up to 20 s)
+            # Register the interceptor as an init script so it survives page reloads
+            try:
+                page.add_init_script(_INTERCEPT_JS)
+            except Exception:
+                pass
+
+            # Check whether we already have tokens from the existing page state
+            _quick_tokens: dict = {}
+            try:
+                _quick_tokens = page.evaluate(_MSAL_TOKEN_JS) or {}
+            except Exception:
+                pass
+            _have_tokens = bool(
+                _quick_tokens.get("graphToken") or _quick_tokens.get("owaToken")
+            )
+
+            if not _have_tokens:
+                # Reload so our interceptor fires from the very start of the page
+                # load and can capture the tokens OWA uses for its own Graph calls.
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=30_000)
+                    time.sleep(2)   # give OWA JS a moment to start making API calls
+                except Exception:
+                    pass
+
+            # Wait up to 40 s for a mail-scoped token (or OWA inbox data)
             user, graph_token, owa_token = _setup_page(
-                page, {}, time.time() + 20
+                page, {}, time.time() + 40
             )
 
             _set(status="active", user=user,

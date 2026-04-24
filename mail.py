@@ -184,6 +184,11 @@ def get_messages(top: int = config.MESSAGES_PER_PAGE, skip: int = 0) -> dict:
         if cached and isinstance(cached, dict) and cached.get("value"):
             cached["value"] = [_normalise(m) for m in cached["value"]]
             return cached
+        # Cache not ready yet — give a more actionable error
+        raise RuntimeError(
+            "Inbox data not available yet. "
+            "Wait a few seconds for Outlook to finish loading, then reload this page."
+        )
     data = _require_ok(result, "list messages")
     if isinstance(data, dict):
         data["value"] = [_normalise(m) for m in data.get("value", [])]

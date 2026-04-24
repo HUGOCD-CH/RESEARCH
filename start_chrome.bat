@@ -47,6 +47,7 @@ start "" "%CHROME_PATH%" ^
   --user-data-dir="%PROFILE_DIR%" ^
   --no-first-run ^
   --no-default-browser-check ^
+  --ignore-certificate-errors ^
   https://webmail.medtronic.com
 
 timeout /t 3 >nul
