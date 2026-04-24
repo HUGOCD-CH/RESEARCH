@@ -8,6 +8,8 @@ Key design choices:
   redirect from webmail.medtronic.com → outlook.cloud.microsoft).
 - Keep-alive tolerates brief navigation pauses before reporting closure.
 """
+import base64
+import json as _json
 import os
 import queue
 import re
@@ -16,6 +18,18 @@ import time
 import config
 
 _SESSION_DIR = os.path.join(os.path.dirname(__file__), ".playwright_session")
+
+
+def _token_has_mail_scope(token: str) -> bool:
+    """Return True if the JWT's scp/scope claim includes mail-related permissions."""
+    try:
+        payload = _json.loads(
+            base64.b64decode(token.split('.')[1] + '==').decode('utf-8', errors='replace')
+        )
+        scp = (payload.get('scp', '') or payload.get('scope', '')).lower()
+        return 'mail' in scp or 'message' in scp
+    except Exception:
+        return False
 
 # ── Shared state ─────────────────────────────────────────────────────────────
 _state: dict = {"status": "idle", "error": None, "user": None}
@@ -347,19 +361,21 @@ window.__MailToken = '';
             #      fires during a fresh MFA login.
             #   3. MSAL sessionStorage — if the app caches tokens there.
             token_deadline = time.time() + 30
-            graph_token = _captured.get("token", "")
+            graph_token = _captured.get("token", "")  # from Python response interceptor
             owa_token = ""
             while time.time() < token_deadline:
                 try:
-                    # Path 1: fetch-intercepted Graph Bearer token.
-                    # Keep reading even if we already have one — the interceptor
-                    # upgrades window.__MailToken whenever it sees a mail-scoped
-                    # token, so later reads may be better than earlier ones.
+                    # Path 1: fetch-intercepted Graph token.
+                    # The JS interceptor always upgrades window.__MailToken to a
+                    # mail-scoped token when one arrives, so keep reading every
+                    # iteration — the first token is often User.Read (profile/photo),
+                    # and the mail-scoped token arrives a second or two later when
+                    # new Outlook fetches the inbox.
                     t = page.evaluate("() => window.__MailToken || ''") or ""
                     if t and t.startswith("eyJ"):
                         graph_token = t
 
-                    # Path 3: MSAL sessionStorage (backup)
+                    # Path 2: MSAL sessionStorage (backup for some tenants)
                     if not graph_token or not owa_token:
                         tokens = page.evaluate(_MSAL_TOKEN_JS)
                         if isinstance(tokens, dict):
@@ -367,8 +383,15 @@ window.__MailToken = '';
                             owa_token   = owa_token   or tokens.get("owaToken", "")
                 except Exception:
                     pass
-                if graph_token or owa_token:
+
+                # Only stop early when we have a confirmed mail-scoped token.
+                # If we only have a non-mail token, keep waiting — OWA will make
+                # a mail API call within a few seconds of the inbox rendering.
+                if owa_token:
                     break
+                if graph_token and _token_has_mail_scope(graph_token):
+                    break
+
                 time.sleep(1)
 
             token = graph_token
