@@ -338,11 +338,13 @@ def _connect_worker(q: queue.Queue):
 
             # Find the OWA tab
             page = None
+            target_ctx = None
             for ctx in browser.contexts:
                 for p in ctx.pages:
                     try:
                         if any(d in p.url for d in _OWA_DOMAINS):
                             page = p
+                            target_ctx = ctx
                             break
                     except Exception:
                         pass
@@ -357,34 +359,92 @@ def _connect_worker(q: queue.Queue):
 
             _set(status="waiting_login")
 
-            # Register the interceptor as an init script so it survives page reloads
-            try:
-                page.add_init_script(_INTERCEPT_JS)
-            except Exception:
-                pass
+            # ── CDP-level response capture ─────────────────────────────────────
+            # page.on("response") hooks into Chrome's network layer, catching
+            # responses from service workers and all frames — more reliable than
+            # patching window.fetch in JavaScript.
+            _cdp_inbox: dict = {}
+            _cdp_token: dict = {"token": ""}
 
-            # Check whether we already have tokens from the existing page state
-            _quick_tokens: dict = {}
-            try:
-                _quick_tokens = page.evaluate(_MSAL_TOKEN_JS) or {}
-            except Exception:
-                pass
-            _have_tokens = bool(
-                _quick_tokens.get("graphToken") or _quick_tokens.get("owaToken")
-            )
-
-            if not _have_tokens:
-                # Reload so our interceptor fires from the very start of the page
-                # load and can capture the tokens OWA uses for its own Graph calls.
+            def _on_cdp_response(response):
                 try:
-                    page.reload(wait_until="domcontentloaded", timeout=30_000)
-                    time.sleep(2)   # give OWA JS a moment to start making API calls
+                    url = response.url
+                    if "graph.microsoft.com" not in url:
+                        return
+                    if not response.ok:
+                        return
+                    # Capture mail-scoped Bearer token from request headers
+                    auth_hdr = response.request.headers.get("authorization", "")
+                    if auth_hdr.lower().startswith("bearer "):
+                        t = auth_hdr[7:]
+                        if t.startswith("eyJ") and _token_has_mail_scope(t):
+                            _cdp_token["token"] = t
+                    # Capture inbox message list
+                    if "/mailFolders" in url or "/messages" in url:
+                        if _cdp_inbox.get("data"):
+                            return  # already have it
+                        data = _json.loads(response.text())
+                        if (isinstance(data, dict) and
+                                isinstance(data.get("value"), list) and
+                                data["value"] and
+                                "subject" in data["value"][0]):
+                            _cdp_inbox["data"] = data
                 except Exception:
                     pass
 
-            # Wait up to 40 s for a mail-scoped token (or OWA inbox data)
+            page.on("response", _on_cdp_response)
+
+            # Register init script so the JS interceptor persists across reloads
+            for target in ([page] + ([target_ctx] if target_ctx else [])):
+                try:
+                    target.add_init_script(_INTERCEPT_JS)
+                except Exception:
+                    pass
+
+            # Always reload so the interceptor is active from page start and
+            # OWA's fresh Graph API calls are captured by both the CDP listener
+            # above and the JS window.fetch patch in _INTERCEPT_JS.
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=30_000)
+            except Exception:
+                pass
+
+            # Poll until we have either inbox data (via CDP) or a usable token
+            deadline = time.time() + 45
+            while time.time() < deadline:
+                if _cdp_inbox.get("data") or _cdp_token.get("token"):
+                    break
+                # Also check JS-level captures
+                try:
+                    tokens = page.evaluate(_MSAL_TOKEN_JS)
+                    if isinstance(tokens, dict):
+                        if tokens.get("graphToken") or tokens.get("owaToken"):
+                            break
+                except Exception:
+                    pass
+                time.sleep(1.5)
+
+            # Push CDP-captured inbox data into the page so mail.py can read it
+            if _cdp_inbox.get("data"):
+                try:
+                    page.evaluate(
+                        "(d) => { window.__InboxData = d; }",
+                        _cdp_inbox["data"]
+                    )
+                except Exception:
+                    pass
+
+            if _cdp_token.get("token"):
+                try:
+                    page.evaluate(
+                        "(t) => { window.__MailToken = t; }",
+                        _cdp_token["token"]
+                    )
+                except Exception:
+                    pass
+
             user, graph_token, owa_token = _setup_page(
-                page, {}, time.time() + 40
+                page, {"token": _cdp_token.get("token", "")}, time.time() + 10
             )
 
             _set(status="active", user=user,
