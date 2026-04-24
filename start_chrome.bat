@@ -1,10 +1,11 @@
 @echo off
 REM =========================================================================
-REM  start_chrome.bat — Opens Chrome with remote debugging on port 9222
+REM  start_chrome.bat — Opens a debug Chrome window for the Outlook Viewer
 REM
-REM  IMPORTANT: Chrome must NOT already be running when you double-click this.
-REM             Close all Chrome windows first, then run this script.
-REM             Your session/cookies are saved, so you won't need MFA again.
+REM  This opens a SEPARATE Chrome window alongside your existing Chrome.
+REM  Your normal Chrome stays open and is not affected.
+REM  Sign in to webmail in the new window, then click "Connect" in the app.
+REM  (MFA is only needed once — the session is saved for next time.)
 REM =========================================================================
 
 set CHROME_PATH=
@@ -17,33 +18,35 @@ for %%p in (
 )
 
 if not defined CHROME_PATH (
-  echo Chrome not found. Please install Google Chrome or update CHROME_PATH in this script.
+  echo Chrome not found. Install Google Chrome or update CHROME_PATH in this script.
   pause
   exit /b 1
 )
 
-REM Check whether Chrome is already running on port 9222
-netstat -an 2>nul | findstr ":9222" >nul 2>&1
+REM Check if port 9222 is already in use
+netstat -an 2>nul | findstr ":9222 " >nul 2>&1
 if %errorlevel% == 0 (
-  echo Chrome is already listening on port 9222. You can go back to the app and click "Try again".
-  pause
+  echo Chrome debug port is already open on port 9222.
+  echo Go back to the app and click "Connect to Running Chrome".
+  timeout /t 5
   exit /b 0
 )
 
-REM Check whether any Chrome process is running at all
-tasklist /fi "imagename eq chrome.exe" 2>nul | findstr /i "chrome.exe" >nul 2>&1
-if %errorlevel% == 0 (
-  echo.
-  echo WARNING: Chrome is already running.
-  echo The --remote-debugging-port flag only works when Chrome starts fresh.
-  echo.
-  echo Please close ALL Chrome windows and then run this script again.
-  echo.
-  pause
-  exit /b 1
-)
+REM Use a dedicated profile so this instance can run alongside your normal Chrome
+set PROFILE_DIR=%LOCALAPPDATA%\OutlookDebugChrome
 
-echo Starting Chrome with remote debugging on port 9222...
-echo Your saved session will be used — no need to log in again.
+echo Opening debug Chrome window (your normal Chrome stays open)...
+echo Profile saved at: %PROFILE_DIR%
 echo.
-start "" "%CHROME_PATH%" --remote-debugging-port=9222 --no-first-run https://webmail.medtronic.com
+echo After the window opens, sign in to webmail if prompted,
+echo then go back to the app and click "Connect to Running Chrome".
+echo.
+
+start "" "%CHROME_PATH%" ^
+  --remote-debugging-port=9222 ^
+  --user-data-dir="%PROFILE_DIR%" ^
+  --no-first-run ^
+  --no-default-browser-check ^
+  https://webmail.medtronic.com
+
+timeout /t 3 >nul
