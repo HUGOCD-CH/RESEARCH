@@ -8,9 +8,27 @@
   <p class="login-error">{{ state.error }}</p>
   {% endif %}
 
-  <p>Clicking the button below opens a browser window to <strong>webmail.medtronic.com</strong>.
-     Sign in there as normal — the app captures your session token automatically.</p>
+  <div class="connect-options">
+    <div class="connect-card">
+      <h2>Option 1 — Use Your Existing Chrome</h2>
+      <p>If Chrome is already open with <strong>webmail.medtronic.com</strong>, this app can attach
+         directly to it. No extra login required.</p>
+      <ol>
+        <li>Start Chrome with remote debugging enabled:<br>
+            <code>chrome.exe --remote-debugging-port=9222</code><br>
+            (or double-click <strong>start_chrome.bat</strong>)</li>
+        <li>Open <strong>webmail.medtronic.com</strong> and log in normally.</li>
+        <li>Click the button below.</li>
+      </ol>
+      <a class="btn" href="{{ url_for('auth_connect') }}">Connect to Running Chrome</a>
+    </div>
 
-  <a class="btn" href="{{ url_for('auth_start') }}">Open Webmail &amp; Sign In</a>
+    <div class="connect-card">
+      <h2>Option 2 — Open a New Browser Window</h2>
+      <p>The app opens a new browser window and navigates to webmail.medtronic.com.
+         Sign in there as normal — MFA is only needed once.</p>
+      <a class="btn btn-secondary" href="{{ url_for('auth_start') }}">Open Webmail &amp; Sign In</a>
+    </div>
+  </div>
 </div>
 {% endblock %}

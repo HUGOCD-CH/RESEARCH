@@ -33,6 +33,12 @@ def auth_start():
     return render_template("waiting.html")
 
 
+@app.route("/auth/connect")
+def auth_connect():
+    auth.connect_browser()
+    return render_template("waiting.html")
+
+
 @app.route("/auth/poll")
 def auth_poll():
     state = auth.get_state()

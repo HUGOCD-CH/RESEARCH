@@ -53,17 +53,38 @@ body {
 
 /* ── Landing ── */
 .landing {
-  background: #fff;
-  border-radius: 8px;
-  padding: 3rem 2rem;
-  max-width: 520px;
+  max-width: 860px;
   margin: 0 auto;
   text-align: center;
-  box-shadow: 0 1px 4px rgba(0,0,0,.08);
 }
-.landing h1 { font-size: 2rem; margin-bottom: 1rem; color: #0078d4; }
-.landing p { margin-bottom: 1rem; color: #444; line-height: 1.6; }
-.landing .btn { margin-top: 0.5rem; font-size: 1rem; padding: 0.7rem 2rem; }
+.landing h1 { font-size: 2rem; margin-bottom: 0.5rem; color: #0078d4; }
+.landing > p { margin-bottom: 1.5rem; color: #444; line-height: 1.6; }
+
+.connect-options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  text-align: left;
+}
+@media (max-width: 640px) { .connect-options { grid-template-columns: 1fr; } }
+
+.connect-card {
+  background: #fff;
+  border-radius: 8px;
+  padding: 1.5rem;
+  box-shadow: 0 1px 4px rgba(0,0,0,.08);
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.connect-card h2 { font-size: 1.1rem; color: #0078d4; }
+.connect-card p, .connect-card li { color: #444; line-height: 1.6; font-size: 0.95rem; }
+.connect-card ol { padding-left: 1.2rem; }
+.connect-card code { background: #f0f0f0; padding: 0.1em 0.35em; border-radius: 3px; font-size: 0.85em; }
+.connect-card .btn { align-self: flex-start; margin-top: auto; padding: 0.55rem 1.4rem; }
+.btn-secondary { background: #555; }
+.btn-secondary:hover { background: #333; }
+.login-error { color: #c00; margin-bottom: 1rem; }
 
 /* ── Device code box ── */
 .device-code-box {

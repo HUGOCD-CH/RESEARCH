@@ -178,6 +178,12 @@ def get_messages(top: int = config.MESSAGES_PER_PAGE, skip: int = 0) -> dict:
     result = _fetch(_inbox_path(top, skip))
     if not result.get("ok") and result.get("status", 0) in (400, 401, 403, 404):
         result = _fetch(_inbox_path(top, skip, owa_mode=True))
+    if not result.get("ok") and result.get("status", 0) in (400, 401, 403, 404):
+        # Last resort: read what OWA already loaded into the page cache
+        cached = auth.evaluate("() => window.__InboxData || null")
+        if cached and isinstance(cached, dict) and cached.get("value"):
+            cached["value"] = [_normalise(m) for m in cached["value"]]
+            return cached
     data = _require_ok(result, "list messages")
     if isinstance(data, dict):
         data["value"] = [_normalise(m) for m in data.get("value", [])]
@@ -190,6 +196,13 @@ def get_message(message_id: str) -> dict:
     result = _fetch(f"/me/messages/{message_id}{graph_qs}")
     if not result.get("ok") and result.get("status", 0) in (400, 401, 403, 404):
         result = _fetch(f"/me/messages/{message_id}{owa_qs}")
+    if not result.get("ok") and result.get("status", 0) in (400, 401, 403, 404):
+        # Read from page-level cache populated by OWA's own fetch interceptor
+        cached = auth.evaluate(
+            f"() => window.__MessageData && window.__MessageData[{json.dumps(message_id)}] || null"
+        )
+        if cached and isinstance(cached, dict):
+            return _normalise(cached)
     return _normalise(_require_ok(result, "get message"))
 
 
