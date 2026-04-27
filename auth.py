@@ -111,6 +111,47 @@ _MSAL_TOKEN_JS = """() => {
 }"""
 
 
+# ── Service-worker Cache Storage reader ──────────────────────────────────────
+# OWA's service worker caches Graph API responses. We can read them directly
+# from the browser's Cache Storage without making new network requests.
+# Returns the first message-list payload found, or null.
+
+_CACHE_STORAGE_JS = """async () => {
+    try {
+        const names = await caches.keys();
+        for (const name of names) {
+            const cache = await caches.open(name);
+            const requests = await cache.keys();
+            for (const req of requests) {
+                const u = req.url;
+                if (!u.includes('graph.microsoft.com')) continue;
+                if (!u.includes('/messages') && !u.includes('/mailFolders')) continue;
+                const resp = await cache.match(req);
+                if (!resp || !resp.ok) continue;
+                try {
+                    const d = await resp.json();
+                    if (d && Array.isArray(d.value) && d.value.length > 0 &&
+                            d.value[0].subject !== undefined)
+                        return d;
+                } catch(e) {}
+            }
+        }
+    } catch(e) {}
+    return null;
+}"""
+
+
+def _read_from_cache_storage() -> dict | None:
+    """Read the inbox message list from the browser's service-worker cache."""
+    try:
+        result = evaluate("(" + _CACHE_STORAGE_JS + ")()")
+        if isinstance(result, dict) and result.get("value"):
+            return result
+    except Exception:
+        pass
+    return None
+
+
 def _read_tokens() -> dict:
     try:
         result = evaluate(_MSAL_TOKEN_JS)
@@ -409,22 +450,39 @@ def _connect_worker(q: queue.Queue):
             except Exception:
                 pass
 
-            # Poll until we have either inbox data (via CDP) or a usable token
-            deadline = time.time() + 45
+            # Poll until inbox data is available (CDP capture or Cache Storage)
+            # or until we have a mail-scoped Bearer token.
+            # Do NOT break early just because MSAL tokens are found — those
+            # tokens get 403 in this environment, so we need the inbox cache.
+            deadline = time.time() + 50
             while time.time() < deadline:
-                if _cdp_inbox.get("data") or _cdp_token.get("token"):
+                if _cdp_inbox.get("data"):
                     break
-                # Also check JS-level captures
+                if _cdp_token.get("token"):
+                    break
+                # Check window.__InboxData (set by the JS interceptor)
                 try:
-                    tokens = page.evaluate(_MSAL_TOKEN_JS)
-                    if isinstance(tokens, dict):
-                        if tokens.get("graphToken") or tokens.get("owaToken"):
-                            break
+                    js_inbox = page.evaluate(
+                        "() => (window.__InboxData && window.__InboxData.value "
+                        "&& window.__InboxData.value.length > 0) "
+                        "? window.__InboxData : null"
+                    )
+                    if js_inbox:
+                        _cdp_inbox["data"] = js_inbox
+                        break
                 except Exception:
                     pass
-                time.sleep(1.5)
+                # Read directly from the service-worker Cache Storage
+                try:
+                    cs_data = page.evaluate("(" + _CACHE_STORAGE_JS + ")()")
+                    if isinstance(cs_data, dict) and cs_data.get("value"):
+                        _cdp_inbox["data"] = cs_data
+                        break
+                except Exception:
+                    pass
+                time.sleep(2)
 
-            # Push CDP-captured inbox data into the page so mail.py can read it
+            # Push any inbox data we found into the page for mail.py to read
             if _cdp_inbox.get("data"):
                 try:
                     page.evaluate(

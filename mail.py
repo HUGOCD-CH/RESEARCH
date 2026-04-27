@@ -179,12 +179,16 @@ def get_messages(top: int = config.MESSAGES_PER_PAGE, skip: int = 0) -> dict:
     if not result.get("ok") and result.get("status", 0) in (400, 401, 403, 404):
         result = _fetch(_inbox_path(top, skip, owa_mode=True))
     if not result.get("ok") and result.get("status", 0) in (400, 401, 403, 404):
-        # Last resort: read what OWA already loaded into the page cache
+        # Try window.__InboxData (set by JS interceptor or connect worker)
         cached = auth.evaluate("() => window.__InboxData || null")
         if cached and isinstance(cached, dict) and cached.get("value"):
             cached["value"] = [_normalise(m) for m in cached["value"]]
             return cached
-        # Cache not ready yet — give a more actionable error
+        # Try reading directly from the service-worker Cache Storage
+        cs = auth._read_from_cache_storage()
+        if cs and cs.get("value"):
+            cs["value"] = [_normalise(m) for m in cs["value"]]
+            return cs
         raise RuntimeError(
             "Inbox data not available yet. "
             "Wait a few seconds for Outlook to finish loading, then reload this page."
